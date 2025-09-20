@@ -21,31 +21,58 @@ builder.Services.AddSingleton<CloudAdapter, CloudAdapter>(sp =>
     var appPassword = Environment.GetEnvironmentVariable("MicrosoftAppPassword");
     var tenantId = Environment.GetEnvironmentVariable("MicrosoftAppTenantId"); // 統一してMicrosoftAppTenantIdを使用
 
-    var appType = Environment.GetEnvironmentVariable("MicrosoftAppType") ?? "SingleTenant"; // 追加で取得
+    var appType = Environment.GetEnvironmentVariable("MicrosoftAppType");
 
-    // Log environment variables for debugging purposes
-    logger.LogInformation("[DEBUG] MicrosoftAppId: {AppId}", appId);
-    logger.LogInformation("[DEBUG] MicrosoftAppPassword: {AppPassword}", appPassword);
-    logger.LogInformation("[DEBUG] MicrosoftAppTenantId: {AppTenantId}", tenantId);
-    logger.LogInformation("[DEBUG] MicrosoftAppType: {AppType}", appType);
+    // 判定: 資格情報が揃っているか
+    var credsProvided = !string.IsNullOrWhiteSpace(appId) && !string.IsNullOrWhiteSpace(appPassword);
 
-    // Log detailed authentication request information
-    logger.LogInformation("[DEBUG] Preparing authentication request with the following details:");
-    logger.LogInformation("[DEBUG] Authentication Endpoint: https://login.microsoftonline.com/{TenantId}/oauth2/v2.0/token", tenantId);
-    logger.LogInformation("[DEBUG] MicrosoftAppId: {AppId}", appId);
-    logger.LogInformation("[DEBUG] MicrosoftTenantId: {TenantId}", tenantId);
-    logger.LogInformation("[DEBUG] MicrosoftAppPassword: {AppPassword}", appPassword);
-    logger.LogInformation("[DEBUG] MicrosoftAppType: {AppType}", Environment.GetEnvironmentVariable("MicrosoftAppType"));
-    logger.LogInformation("[DEBUG] MicrosoftAppTenantId: {AppTenantId}", Environment.GetEnvironmentVariable("MicrosoftAppTenantId"));
+    // Log environment variables for debugging purposes (パスワードはマスク)
+    //logger.LogInformation("[DEBUG] MicrosoftAppId: {AppId}", string.IsNullOrEmpty(appId) ? "<empty>" : appId);
+    //logger.LogInformation("[DEBUG] MicrosoftAppPassword: {AppPassword}", string.IsNullOrEmpty(appPassword) ? "<empty>" : new string('*', Math.Min(8, appPassword!.Length)));
+    //logger.LogInformation("[DEBUG] MicrosoftAppTenantId: {AppTenantId}", string.IsNullOrEmpty(tenantId) ? "<empty>" : tenantId);
+    //logger.LogInformation("[DEBUG] MicrosoftAppType: {AppType}", string.IsNullOrEmpty(appType) ? "<empty>" : appType);
+
+    if (!credsProvided)
+    {
+        // ローカル開発（Emulator）向け: 認証なしで起動
+        logger.LogWarning("[DEBUG] AppId/Password が未設定のため、ローカル用に Authentication を無効化して起動します（Emulator からの匿名アクセスを許可）。");
+    }
+
+    // Log detailed authentication request information（実際に資格情報がある場合のみ詳細を出す）
+    if (credsProvided)
+    {
+        var effectiveAppType = string.IsNullOrWhiteSpace(appType) ? "SingleTenant" : appType;
+        logger.LogInformation("[DEBUG] Preparing authentication request with the following details:");
+        logger.LogInformation("[DEBUG] Authentication Endpoint: https://login.microsoftonline.com/{TenantId}/oauth2/v2.0/token", tenantId);
+        logger.LogInformation("[DEBUG] MicrosoftAppId: {AppId}", appId);
+        logger.LogInformation("[DEBUG] MicrosoftAppTenantId: {TenantId}", tenantId);
+        logger.LogInformation("[DEBUG] MicrosoftAppType: {AppType}", effectiveAppType);
+    }
+
+    // 構成を条件付きで組み立て
+    var settings = new Dictionary<string, string?>();
+    if (credsProvided)
+    {
+        var effectiveAppType = string.IsNullOrWhiteSpace(appType) ? "SingleTenant" : appType;
+        settings["MicrosoftAppId"] = appId;
+        settings["MicrosoftAppPassword"] = appPassword;
+        settings["MicrosoftAppType"] = effectiveAppType;
+        if (string.Equals(effectiveAppType, "SingleTenant", StringComparison.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+            {
+                logger.LogWarning("[DEBUG] MicrosoftAppTenantId が未設定ですが、AppType=SingleTenant です。認証に失敗します。Azure での動作用にテナントIDを設定してください。");
+            }
+            else
+            {
+                settings["MicrosoftAppTenantId"] = tenantId;
+            }
+        }
+    }
+    // credsProvided=false の場合は settings を空のまま渡す → SDK が Authentication Disabled として動作
 
     var botFrameworkAuthentication = new ConfigurationBotFrameworkAuthentication(new ConfigurationBuilder()
-        .AddInMemoryCollection(new Dictionary<string, string?>
-        {
-            { "MicrosoftAppId", appId },
-            { "MicrosoftAppPassword", appPassword },
-            { "MicrosoftAppType", appType },
-            { "MicrosoftAppTenantId", tenantId }
-        })
+        .AddInMemoryCollection(settings)
         .Build());
 
     return new CloudAdapter(botFrameworkAuthentication, logger);
