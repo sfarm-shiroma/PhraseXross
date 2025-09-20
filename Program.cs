@@ -14,7 +14,40 @@ builder.Services.AddControllers();
 builder.Services.AddSingleton<CloudAdapter, CloudAdapter>(sp =>
 {
     var logger = sp.GetRequiredService<ILogger<CloudAdapter>>();
-    var botFrameworkAuthentication = new ConfigurationBotFrameworkAuthentication(builder.Configuration);
+
+    // Retrieve credentials from environment variables
+    // Log environment variables for debugging purposes with detailed information
+    var appId = Environment.GetEnvironmentVariable("MicrosoftAppId");
+    var appPassword = Environment.GetEnvironmentVariable("MicrosoftAppPassword");
+    var tenantId = Environment.GetEnvironmentVariable("MicrosoftAppTenantId"); // 統一してMicrosoftAppTenantIdを使用
+
+    var appType = Environment.GetEnvironmentVariable("MicrosoftAppType") ?? "SingleTenant"; // 追加で取得
+
+    // Log environment variables for debugging purposes
+    logger.LogInformation("[DEBUG] MicrosoftAppId: {AppId}", appId);
+    logger.LogInformation("[DEBUG] MicrosoftAppPassword: {AppPassword}", appPassword);
+    logger.LogInformation("[DEBUG] MicrosoftAppTenantId: {AppTenantId}", tenantId);
+    logger.LogInformation("[DEBUG] MicrosoftAppType: {AppType}", appType);
+
+    // Log detailed authentication request information
+    logger.LogInformation("[DEBUG] Preparing authentication request with the following details:");
+    logger.LogInformation("[DEBUG] Authentication Endpoint: https://login.microsoftonline.com/{TenantId}/oauth2/v2.0/token", tenantId);
+    logger.LogInformation("[DEBUG] MicrosoftAppId: {AppId}", appId);
+    logger.LogInformation("[DEBUG] MicrosoftTenantId: {TenantId}", tenantId);
+    logger.LogInformation("[DEBUG] MicrosoftAppPassword: {AppPassword}", appPassword);
+    logger.LogInformation("[DEBUG] MicrosoftAppType: {AppType}", Environment.GetEnvironmentVariable("MicrosoftAppType"));
+    logger.LogInformation("[DEBUG] MicrosoftAppTenantId: {AppTenantId}", Environment.GetEnvironmentVariable("MicrosoftAppTenantId"));
+
+    var botFrameworkAuthentication = new ConfigurationBotFrameworkAuthentication(new ConfigurationBuilder()
+        .AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            { "MicrosoftAppId", appId },
+            { "MicrosoftAppPassword", appPassword },
+            { "MicrosoftAppType", appType },
+            { "MicrosoftAppTenantId", tenantId }
+        })
+        .Build());
+
     return new CloudAdapter(botFrameworkAuthentication, logger);
 });
 builder.Services.AddTransient<IBot, SimpleBot>(); // Replace SimpleBot with your bot implementation
