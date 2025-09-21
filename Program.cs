@@ -82,6 +82,11 @@ builder.Services.AddSingleton<CloudAdapter, CloudAdapter>(sp =>
 });
 builder.Services.AddTransient<IBot, SimpleBot>(); // Replace SimpleBot with your bot implementation
 
+// Bot State for multi-turn conversation (yes/no confirmation flow)
+builder.Services.AddSingleton<IStorage, MemoryStorage>();
+builder.Services.AddSingleton<UserState>(sp => new UserState(sp.GetRequiredService<IStorage>()));
+builder.Services.AddSingleton<ConversationState>(sp => new ConversationState(sp.GetRequiredService<IStorage>()));
+
 // Semantic Kernel (optional)
 // ENABLE_SK=true かつ AOAI_* が揃っている場合のみ Kernel を登録
 bool IsSkEnabled(IConfiguration cfg)
