@@ -50,3 +50,59 @@ Web Apps に以下の環境変数を設定してください:
 ## デプロイ後の確認
 - Web Apps にデプロイ後、Bot Framework Emulator または Microsoft Teams を使用して応答を確認してください。
 
+---
+
+## Semantic Kernel (Azure OpenAI) 連携
+
+このボットはオプションで Semantic Kernel を使ったAI応答が可能です。無効時は従来のエコー応答になります。
+
+### 有効化フラグ
+- `ENABLE_SK`: `true` で有効化（既定は無効）。
+
+### 必要な環境変数（AOAI）
+- `AOAI_ENDPOINT`: 例 `https://<your-aoai>.openai.azure.com/`
+- `AOAI_API_KEY`: Azure OpenAI のAPIキー
+- `AOAI_DEPLOYMENT`: 使用するデプロイ名（gpt-4o/4.1/3.5などのデプロイ）
+
+上記3つが揃っていない場合は、ENABLE_SK=true でも自動的にSK登録はスキップされ、エコー応答にフォールバックします（起動ログにWARNを出力）。
+
+### ローカル（dotnet run）
+PowerShell の例:
+
+```
+$env:ENABLE_SK = "true"
+$env:AOAI_ENDPOINT = "https://<your-aoai>.openai.azure.com/"
+$env:AOAI_API_KEY = "<your-key>"
+$env:AOAI_DEPLOYMENT = "<your-deployment>"
+dotnet run --project ./PhraseXross
+```
+
+### コンテナ（Docker）
+`-e` で必要な環境変数を渡します。
+
+```
+docker run -it --rm -p 5006:8080 \
+   -e ENABLE_SK=true \
+   -e AOAI_ENDPOINT=https://<your-aoai>.openai.azure.com/ \
+   -e AOAI_API_KEY=<your-key> \
+   -e AOAI_DEPLOYMENT=<your-deployment> \
+   phrasexross:latest
+```
+
+Bot Framework Emulator を使う場合、コンテナでは `serviceUrl` が localhost にならないように、Dev Tunnels などを使ってパブリックHTTPSのURLにする必要があります（本README先頭の注意を参照）。
+
+### Azure Web Apps
+アプリケーション設定に以下を追加してください:
+
+- `ENABLE_SK` = `true`
+- `AOAI_ENDPOINT` = `https://<your-aoai>.openai.azure.com/`
+- `AOAI_API_KEY` = `<your-key>`
+- `AOAI_DEPLOYMENT` = `<your-deployment>`
+
+Azure上では `MicrosoftAppId/MicrosoftAppPassword/MicrosoftAppTenantId/MicrosoftAppType` も既に設定済みであることを前提とします。
+
+### 動作確認
+1. 起動ログで `[SK] Semantic Kernel を登録しました` が出力されていることを確認。
+2. Emulator（またはTeams）でメッセージを送信。
+3. AI応答が返らない場合、起動時のWARNログや `AOAI_*` 値の設定漏れ/誤りを確認してください。
+

@@ -3,6 +3,9 @@ using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Bot.Connector;
 using Microsoft.Bot.Connector.Authentication;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Configuration;
+using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel.Connectors.AzureOpenAI;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -78,6 +81,44 @@ builder.Services.AddSingleton<CloudAdapter, CloudAdapter>(sp =>
     return new CloudAdapter(botFrameworkAuthentication, logger);
 });
 builder.Services.AddTransient<IBot, SimpleBot>(); // Replace SimpleBot with your bot implementation
+
+// Semantic Kernel (optional)
+// ENABLE_SK=true かつ AOAI_* が揃っている場合のみ Kernel を登録
+bool IsSkEnabled(IConfiguration cfg)
+{
+    var flag = Environment.GetEnvironmentVariable("ENABLE_SK") ?? cfg["Features:ENABLE_SK"] ?? "false";
+    Console.WriteLine($"[DEBUG] ENABLE_SK: {flag}");
+    return string.Equals(flag, "true", StringComparison.OrdinalIgnoreCase);
+}
+
+if (IsSkEnabled(builder.Configuration))
+{
+    // 事前に構成が揃っているか確認し、不足時は登録スキップ
+    string? endpoint = Environment.GetEnvironmentVariable("AOAI_ENDPOINT");
+    string? apiKey = Environment.GetEnvironmentVariable("AOAI_API_KEY");
+    string? deployment = Environment.GetEnvironmentVariable("AOAI_DEPLOYMENT");
+
+    Console.WriteLine($"[DEBUG] AOAI_ENDPOINT: {endpoint}");
+    Console.WriteLine($"[DEBUG] AOAI_API_KEY: {apiKey}");
+    Console.WriteLine($"[DEBUG] AOAI_DEPLOYMENT: {deployment}");
+
+    if (string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(apiKey) || string.IsNullOrWhiteSpace(deployment))
+    {
+        Console.WriteLine("[SK] ENABLE_SK=true ですが AOAI_ENDPOINT/AOAI_API_KEY/AOAI_DEPLOYMENT のいずれかが未設定のため、Semantic Kernel の登録をスキップします。");
+    }
+    else
+    {
+        builder.Services.AddSingleton<Kernel>(sp =>
+        {
+            var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("SK");
+            var kb = Kernel.CreateBuilder();
+            kb.AddAzureOpenAIChatCompletion(deployment, endpoint, apiKey);
+            var kernel = kb.Build();
+            logger.LogInformation("[SK] Semantic Kernel を登録しました (deployment={Deployment}, endpoint={Endpoint})", deployment, endpoint);
+            return kernel;
+        });
+    }
+}
 
 var app = builder.Build();
 

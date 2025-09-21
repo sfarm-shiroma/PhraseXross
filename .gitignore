@@ -1,0 +1,25 @@
+# Ignore appsettings files containing sensitive information
+appsettings.json
+appsettings.Development.json
+
+# Ignore build outputs
+bin/
+obj/
+
+# Ignore user-specific files
+.vs/
+
+# Ignore other unnecessary files
+*.user
+*.suo
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Ignore IDE-specific settings
+.idea/
+.vscode/
+
+# Exclude .env file containing sensitive environment variables
+.env

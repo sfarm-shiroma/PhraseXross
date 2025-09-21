@@ -1,0 +1,11 @@
+{
+  "AzureOpenAI": {
+    "AOAI_ENDPOINT": "https://<your-aoai-resource>.openai.azure.com/",
+    "AOAI_API_KEY": "",
+    "AOAI_DEPLOYMENT": "<your-deployment-name>",
+    "AOAI_API_VERSION": "2024-06-01"
+  },
+  "Features": {
+    "ENABLE_SK": false
+  }
+}

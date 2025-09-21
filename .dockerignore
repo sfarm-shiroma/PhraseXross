@@ -1,0 +1,19 @@
+# Build context から除外
+bin/
+obj/
+.vs/
+.vscode/
+.git
+.gitignore
+
+# ローカル専用設定（コンテナに含めない）
+appsettings.json
+appsettings.Development.json
+
+# その他
+*.user
+*.suo
+*.log
+*.tmp
+*.bak
+*.swp

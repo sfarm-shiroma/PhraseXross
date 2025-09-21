@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("PhraseXross")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+666845ade6f0180726bf5feb4eaf9089d6663178")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+6b74757e29ed92cf09fd79d10612b921d7539277")]
 [assembly: System.Reflection.AssemblyProductAttribute("PhraseXross")]
 [assembly: System.Reflection.AssemblyTitleAttribute("PhraseXross")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
