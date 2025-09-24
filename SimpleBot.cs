@@ -179,7 +179,69 @@ public class SimpleBot : ActivityHandler
                 return;
             }
 
-            // Step4は未実装（Step3まで）
+            // Step4（提供価値・差別化のコア）フロー
+            if (state.Step1Completed && state.Step2Completed && state.Step3Completed && !state.Step4Completed)
+            {
+                var cEval = await EvaluateCoreAsync(_kernel, transcript, state.Step1SummaryJson, state.FinalTarget, state.FinalUsageContext, cancellationToken);
+                if (cEval != null && cEval.IsSatisfied)
+                {
+                    state.FinalCoreValue = string.IsNullOrWhiteSpace(cEval.Core) ? state.FinalCoreValue : cEval.Core;
+
+                    var cAck = $"コア（提供価値・差別化）、承知しました。ありがとうございます。\n- {state.FinalCoreValue}";
+                    Console.WriteLine($"[USER_MESSAGE] {cAck}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(cAck, cAck), cancellationToken);
+
+                    state.Step4Completed = true; // Step4完了
+
+                    if (_conversationState != null)
+                    {
+                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        await accessor.SetAsync(turnContext, state, cancellationToken);
+                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    }
+                    return;
+                }
+
+                // 未確定: 既出の手がかりを活かして次の質問を生成
+                var cAsk = await GenerateNextCoreQuestionAsync(
+                    _kernel,
+                    transcript,
+                    state.Step1SummaryJson,
+                    state.FinalTarget,
+                    state.FinalUsageContext,
+                    state.Step4QuestionCount,
+                    cancellationToken);
+
+                if (string.IsNullOrWhiteSpace(cAsk))
+                {
+                    cAsk = await GenerateNextCoreQuestionAsync(
+                        _kernel,
+                        transcript,
+                        state.Step1SummaryJson,
+                        state.FinalTarget,
+                        state.FinalUsageContext,
+                        state.Step4QuestionCount,
+                        cancellationToken);
+                }
+
+                if (!string.IsNullOrWhiteSpace(cAsk))
+                {
+                    state.History.Add($"Assistant: {cAsk}");
+                    TrimHistory(state.History, 30);
+                    state.Step4QuestionCount++;
+
+                    if (_conversationState != null)
+                    {
+                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        await accessor.SetAsync(turnContext, state, cancellationToken);
+                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    }
+
+                    Console.WriteLine($"[USER_MESSAGE] {cAsk}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(cAsk, cAsk), cancellationToken);
+                }
+                return;
+            }
 
             // Step1: 目的評価
             var eval = await EvaluatePurposeAsync(_kernel, transcript, cancellationToken);
@@ -469,6 +531,92 @@ public class SimpleBot : ActivityHandler
     }
 
 
+    // Step4: 提供価値・差別化のコアが十分に定義されたかを評価
+    private static async Task<CoreDecision?> EvaluateCoreAsync(
+        Kernel kernel,
+        string transcript,
+        string? step1SummaryJson,
+        string? finalTarget,
+        string? finalUsageContext,
+        CancellationToken ct)
+    {
+        var chat = kernel.GetRequiredService<IChatCompletionService>();
+        var history = new ChatHistory();
+        history.AddSystemMessage(@"あなたは第三者のレビュアーです。今はステップ4『提供価値・差別化のコア』のみを評価します。
+            ここでいうコアとは、ユーザーにとっての価値の中核や、競合と比べたときの差別化要素です。
+            会話履歴と、もしあればStep1要約JSON内の 'coreDriver' や 'subjectOrHero'、'references.essenceHints' を手掛かりに、既出の情報のみから判断します。
+
+            判定基準：
+            - どんな価値／差別化を打ち出すのかが1行で説明できること（例：初心者でも10分で設定完了、地元の実例ストーリーで信頼感、等）
+            - 既出の事実に基づくこと（推測や新規追加はしない）
+
+            出力は次のJSONのみ：
+            {
+                ""isSatisfied"": true,
+                ""core"": ""1行の要約（未確定なら空）"",
+                ""reason"": ""判断理由（不足点も簡潔に）""
+            }");
+
+        var ctx = new List<string>();
+        ctx.Add(string.IsNullOrWhiteSpace(step1SummaryJson) ? "(Step1要約なし)" : step1SummaryJson!);
+        if (!string.IsNullOrWhiteSpace(finalTarget)) ctx.Add($"[FinalTarget] {finalTarget}");
+        if (!string.IsNullOrWhiteSpace(finalUsageContext)) ctx.Add($"[FinalUsageContext] {finalUsageContext}");
+
+        history.AddUserMessage($"--- コンテキスト ---\n{string.Join("\n", ctx)}\n\n--- 会話履歴 ---\n{transcript}");
+
+        var response = await chat.GetChatMessageContentAsync(history, kernel: kernel, cancellationToken: ct);
+        var json = response?.Content?.Trim();
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            bool isSat = root.TryGetProperty("isSatisfied", out var satEl) && satEl.ValueKind == JsonValueKind.True;
+            string? core = root.TryGetProperty("core", out var cEl) && cEl.ValueKind == JsonValueKind.String ? cEl.GetString() : null;
+            string? reason = root.TryGetProperty("reason", out var rEl) && rEl.ValueKind == JsonValueKind.String ? rEl.GetString() : null;
+            return new CoreDecision { IsSatisfied = isSat, Core = core, Reason = reason };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // Step4: 次のコア確認質問を生成（既出の手がかりを活かす）
+    private static async Task<string?> GenerateNextCoreQuestionAsync(
+        Kernel kernel,
+        string transcript,
+        string? step1SummaryJson,
+        string? finalTarget,
+        string? finalUsageContext,
+        int questionCount,
+        CancellationToken ct)
+    {
+        var chat = kernel.GetRequiredService<IChatCompletionService>();
+        var history = new ChatHistory();
+        var pacing = questionCount >= 2
+            ? "（質問が続いているため、深掘りは控えめに。2〜3個の仮説候補を各1行で示し、『どれが近い？／他にありますか？』とだけ確認）"
+            : string.Empty;
+        history.AddSystemMessage(@$"あなたはやさしく話すマーケティングのプロです。工程名は出さず、自然な対話で『提供価値・差別化のコア』だけを確かめます。
+            既出の手がかり（Step1要約のcoreDriver/subjectOrHero/essenceHints、確定済みのターゲットや媒体、会話内の記述）を尊重し、重複確認は手短に。許可ベースで短く1つだけ質問してください{pacing}。
+
+            コア以外（目的/ターゲット/媒体の再確認、表現案、制作条件など）は扱いません（別フェーズ）。
+
+            必要に応じて2〜3個の候補（各1行）を示し、『どれが近いですか？／他にありますか？』と軽く確認するのはOKです。
+
+            出力はユーザーにそのまま見せる日本語のテキストのみ。");
+
+        var ctx = new List<string>();
+        ctx.Add(string.IsNullOrWhiteSpace(step1SummaryJson) ? "(Step1要約なし)" : step1SummaryJson!);
+        if (!string.IsNullOrWhiteSpace(finalTarget)) ctx.Add($"[FinalTarget] {finalTarget}");
+        if (!string.IsNullOrWhiteSpace(finalUsageContext)) ctx.Add($"[FinalUsageContext] {finalUsageContext}");
+        history.AddUserMessage($"--- コンテキスト（参考） ---\n{string.Join("\n", ctx)}\n\n--- 会話履歴 ---\n{transcript}");
+
+        var response = await chat.GetChatMessageContentAsync(history, kernel: kernel, cancellationToken: ct);
+        return response?.Content?.Trim();
+    }
+
+
         private static async Task<EvalDecision?> EvaluatePurposeAsync(Kernel kernel, string transcript, CancellationToken ct)
     {
     var chat = kernel.GetRequiredService<IChatCompletionService>();
@@ -731,13 +879,16 @@ public class ElicitationState
     public bool Step1Completed { get; set; } = false;
     public bool Step2Completed { get; set; } = false;
     public bool Step3Completed { get; set; } = false;
+    public bool Step4Completed { get; set; } = false;
     // Step2（ターゲット）
     public int Step2QuestionCount { get; set; } = 0;
     public string? FinalTarget { get; set; }
     // Step3（媒体）
     public int Step3QuestionCount { get; set; } = 0;
     public string? FinalUsageContext { get; set; }
-    // Step4は未実装
+    // Step4（コア）
+    public int Step4QuestionCount { get; set; } = 0;
+    public string? FinalCoreValue { get; set; }
 }
 
 // 評価者の判定結果
@@ -764,6 +915,12 @@ public class MediaDecision
     public string? Reason { get; set; }
 }
 
-// Step4は未実装（Step3まで）
+// コア（提供価値・差別化）評価結果
+public class CoreDecision
+{
+    public bool IsSatisfied { get; set; }
+    public string? Core { get; set; }
+    public string? Reason { get; set; }
+}
 
-// フロー: Step1（目的）→ Step2（ターゲット）→ Step3（媒体/利用シーン）
+// フロー: Step1（目的）→ Step2（ターゲット）→ Step3（媒体/利用シーン）→ Step4（提供価値・差別化のコア）
