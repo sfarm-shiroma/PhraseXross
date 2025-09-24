@@ -15,26 +15,6 @@ public class SimpleBot : ActivityHandler
     private readonly Kernel? _kernel; // optional
     private readonly ConversationState? _conversationState;
 
-    // 将来のStep拡張に備え、Stepごとのシステムメッセージ切替を簡単にする薄い仕組み
-    private enum StepPhase
-    {
-        Step1Purpose,
-        // Step2Target,
-        // Step3Expression,
-    }
-
-    private static class PromptCatalog
-    {
-        public static string Ack(StepPhase step) => step switch
-        {
-            StepPhase.Step1Purpose => @"あなたは丁寧で軽やかなアシスタントです。以下の会話と受け取った活動目的を踏まえ、
-承知の意を短く1文だけ日本語で伝えてください。敬語は自然体で、堅すぎず、命令形や謝罪は避けます。
-禁止：目的の言い換えの羅列、評価的コメント、次の質問。
-出力はそのままユーザーに見せる1文のみ。",
-            _ => @"あなたは丁寧で軽やかなアシスタントです。以下の会話を踏まえ、要点を短く1文で伝えてください。"
-        };
-    }
-
     public SimpleBot(Kernel? kernel = null, ConversationState? conversationState = null)
     {
         _kernel = kernel;
@@ -77,7 +57,131 @@ public class SimpleBot : ActivityHandler
             TrimHistory(state.History, 30);
             var transcript = string.Join("\n", state.History);
 
-            // Step1: 目的評価のみ
+            // 既にStep1が完了している場合はStep2（ターゲット）フローに分岐
+            if (state.Step1Completed && !state.Step2Completed)
+            {
+                // まず、ターゲットが十分に固まっているかを評価
+                var tEval = await EvaluateTargetAsync(_kernel, transcript, state.Step1SummaryJson, cancellationToken);
+                if (tEval != null && tEval.IsSatisfied)
+                {
+                    state.FinalTarget = string.IsNullOrWhiteSpace(tEval.Target) ? state.FinalTarget : tEval.Target;
+
+                    // 簡潔に承知のみ（Step2はAI生成の承知文は使わず最小限の固定文）
+                    var tAck = $"ターゲット像、承知しました。ありがとうございます。\n- {state.FinalTarget}";
+                    Console.WriteLine($"[USER_MESSAGE] {tAck}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(tAck, tAck), cancellationToken);
+
+                    state.Step2Completed = true; // ターゲット完了
+
+                    // Step3（媒体/利用シーン）へ最初の短い質問を投げる
+                    var mFirst = await GenerateNextMediaQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step3QuestionCount, cancellationToken);
+                    if (string.IsNullOrWhiteSpace(mFirst))
+                    {
+                        mFirst = await GenerateNextMediaQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step3QuestionCount, cancellationToken);
+                    }
+                    if (!string.IsNullOrWhiteSpace(mFirst))
+                    {
+                        state.History.Add($"Assistant: {mFirst}");
+                        TrimHistory(state.History, 30);
+                        state.Step3QuestionCount++;
+
+                        Console.WriteLine($"[USER_MESSAGE] {mFirst}");
+                        await turnContext.SendActivityAsync(MessageFactory.Text(mFirst, mFirst), cancellationToken);
+                    }
+
+                    // 状態保存
+                    if (_conversationState != null)
+                    {
+                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        await accessor.SetAsync(turnContext, state, cancellationToken);
+                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    }
+                    return;
+                }
+
+                // 未確定: 既出の手がかりを踏まえて次のターゲット質問を生成
+                var tAsk = await GenerateNextTargetQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step2QuestionCount, cancellationToken);
+
+                if (string.IsNullOrWhiteSpace(tAsk))
+                {
+                    // 1回だけAIに再試行
+                    tAsk = await GenerateNextTargetQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step2QuestionCount, cancellationToken);
+                }
+
+                if (!string.IsNullOrWhiteSpace(tAsk))
+                {
+                    state.History.Add($"Assistant: {tAsk}");
+                    TrimHistory(state.History, 30);
+                    state.Step2QuestionCount++;
+
+                    // 状態保存
+                    if (_conversationState != null)
+                    {
+                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        await accessor.SetAsync(turnContext, state, cancellationToken);
+                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    }
+
+                    Console.WriteLine($"[USER_MESSAGE] {tAsk}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(tAsk, tAsk), cancellationToken);
+                }
+                return;
+            }
+
+            // Step3（媒体/利用シーン）フロー
+            if (state.Step1Completed && state.Step2Completed && !state.Step3Completed)
+            {
+                // 既出の usageContext などを踏まえて十分性を評価
+                var mEval = await EvaluateMediaAsync(_kernel, transcript, state.Step1SummaryJson, cancellationToken);
+                if (mEval != null && mEval.IsSatisfied)
+                {
+                    state.FinalUsageContext = string.IsNullOrWhiteSpace(mEval.MediaOrContext) ? state.FinalUsageContext : mEval.MediaOrContext;
+
+                    var mAck = $"媒体／利用シーン、承知しました。ありがとうございます。\n- {state.FinalUsageContext}";
+                    Console.WriteLine($"[USER_MESSAGE] {mAck}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(mAck, mAck), cancellationToken);
+
+                    state.Step3Completed = true; // 媒体完了
+
+                    // 状態保存
+                    if (_conversationState != null)
+                    {
+                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        await accessor.SetAsync(turnContext, state, cancellationToken);
+                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    }
+                    return;
+                }
+
+                // 未確定: 既出の usageContext を活かして次の質問を生成
+                var mAsk = await GenerateNextMediaQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step3QuestionCount, cancellationToken);
+                if (string.IsNullOrWhiteSpace(mAsk))
+                {
+                    mAsk = await GenerateNextMediaQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step3QuestionCount, cancellationToken);
+                }
+                if (!string.IsNullOrWhiteSpace(mAsk))
+                {
+                    state.History.Add($"Assistant: {mAsk}");
+                    TrimHistory(state.History, 30);
+                    state.Step3QuestionCount++;
+
+                    // 状態保存
+                    if (_conversationState != null)
+                    {
+                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        await accessor.SetAsync(turnContext, state, cancellationToken);
+                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    }
+
+                    Console.WriteLine($"[USER_MESSAGE] {mAsk}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(mAsk, mAsk), cancellationToken);
+                }
+                return;
+            }
+
+            // Step4は未実装（Step3まで）
+
+            // Step1: 目的評価
             var eval = await EvaluatePurposeAsync(_kernel, transcript, cancellationToken);
             if (eval != null && eval.IsSatisfied)
             {
@@ -103,6 +207,25 @@ public class SimpleBot : ActivityHandler
                 var summaryMsg = $"— ここまでの整理 —\n{summaryView}";
                 Console.WriteLine($"[USER_MESSAGE] {summaryMsg}");
                 await turnContext.SendActivityAsync(MessageFactory.Text(summaryMsg, summaryMsg), cancellationToken);
+
+                // Step1完了フラグ
+                state.Step1Completed = true;
+
+                // 直後にStep2（ターゲット）への最初の短い質問を1つだけ行う
+                var tFirst = await GenerateNextTargetQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step2QuestionCount, cancellationToken);
+                if (string.IsNullOrWhiteSpace(tFirst))
+                {
+                    tFirst = await GenerateNextTargetQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step2QuestionCount, cancellationToken);
+                }
+                if (!string.IsNullOrWhiteSpace(tFirst))
+                {
+                    state.History.Add($"Assistant: {tFirst}");
+                    TrimHistory(state.History, 30);
+                    state.Step2QuestionCount++;
+
+                    Console.WriteLine($"[USER_MESSAGE] {tFirst}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(tFirst, tFirst), cancellationToken);
+                }
 
                 // 状態保存
                 if (_conversationState != null)
@@ -200,13 +323,151 @@ public class SimpleBot : ActivityHandler
     // 目的受領時の承知メッセージをAIに1文で生成させる
     private static async Task<string?> GenerateAckMessageAsync(Kernel kernel, string transcript, string purpose, CancellationToken ct)
     {
-    var chat = kernel.GetRequiredService<IChatCompletionService>();
-    var history = new ChatHistory();
-    history.AddSystemMessage(PromptCatalog.Ack(StepPhase.Step1Purpose));
+        var chat = kernel.GetRequiredService<IChatCompletionService>();
+        var history = new ChatHistory();
+        history.AddSystemMessage(@"あなたは丁寧で軽やかなアシスタントです。以下の会話と受け取った活動目的を踏まえ、
+承知の意を短く1文だけ日本語で伝えてください。敬語は自然体で、堅すぎず、命令形や謝罪は避けます。
+禁止：目的の言い換えの羅列、評価的コメント、次の質問。
+出力はそのままユーザーに見せる1文のみ。");
         history.AddUserMessage($"--- 受領目的 ---\n{purpose}\n\n--- 会話履歴 ---\n{transcript}");
         var response = await chat.GetChatMessageContentAsync(history, kernel: kernel, cancellationToken: ct);
         return response?.Content?.Trim();
     }
+
+    // Step2: ターゲットが十分に定義されたかを評価
+    private static async Task<TargetDecision?> EvaluateTargetAsync(Kernel kernel, string transcript, string? step1SummaryJson, CancellationToken ct)
+    {
+        var chat = kernel.GetRequiredService<IChatCompletionService>();
+        var history = new ChatHistory();
+        history.AddSystemMessage(@"あなたは第三者のレビュアーです。今はステップ2『ターゲット』のみを評価します。
+            ここでいうターゲットは、誰に届けるかの像（例：属性、役割、状況、顧客段階など）です。
+            会話履歴と、もしあればステップ1要約JSON内の 'audience' や 'references.targetHints' を手掛かりに、既出の情報のみから判断します。
+
+            判定基準：
+            - 誰に向けたコピーかが1行で説明できること（例：関東圏の大学1〜2年生、既存のライトユーザー など）
+            - 既出の事実に基づくこと（推測や新規追加はしない）
+
+            出力は次のJSONのみ：
+            {
+                ""isSatisfied"": true,
+                ""target"": ""1行の要約（未確定なら空）"",
+                ""reason"": ""判断理由（不足点も簡潔に）""
+            }");
+        var contextBlock = string.IsNullOrWhiteSpace(step1SummaryJson)
+            ? "(Step1要約なし)"
+            : step1SummaryJson;
+        history.AddUserMessage($"--- Step1要約JSON ---\n{contextBlock}\n\n--- 会話履歴 ---\n{transcript}");
+
+        var response = await chat.GetChatMessageContentAsync(history, kernel: kernel, cancellationToken: ct);
+        var json = response?.Content?.Trim();
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            bool isSat = root.TryGetProperty("isSatisfied", out var satEl) && satEl.ValueKind == JsonValueKind.True;
+            string? target = root.TryGetProperty("target", out var tEl) && tEl.ValueKind == JsonValueKind.String ? tEl.GetString() : null;
+            string? reason = root.TryGetProperty("reason", out var rEl) && rEl.ValueKind == JsonValueKind.String ? rEl.GetString() : null;
+            return new TargetDecision { IsSatisfied = isSat, Target = target, Reason = reason };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // Step2: 次のターゲット確認質問を生成（既出の手がかりを活かす）
+    private static async Task<string?> GenerateNextTargetQuestionAsync(Kernel kernel, string transcript, string? step1SummaryJson, int questionCount, CancellationToken ct)
+    {
+        var chat = kernel.GetRequiredService<IChatCompletionService>();
+        var history = new ChatHistory();
+        var pacing = questionCount >= 2
+            ? "（質問が続いているため、深掘りは控えめに。2〜3個の選択肢を各1行で示し、『どれが近い？／他にありますか？』とだけ確認）"
+            : string.Empty;
+        history.AddSystemMessage(@$"あなたはやさしく話すマーケティングのプロです。工程名は出さず、自然な対話で『ターゲット』だけを確かめます。
+            既出の手がかり（Step1要約のaudienceやtargetHints、会話内の記述）を尊重し、重複確認は手短に。許可ベースで短く1つだけ質問してください{pacing}。
+
+            ターゲット以外（目的の再評価、表現案、制作条件など）は扱いません（別フェーズ）。
+
+            必要に応じて2〜3個の候補（各1行）を示し、『どれが近いですか？／他にありますか？』と軽く確認するのはOKです。
+
+            出力はユーザーにそのまま見せる日本語のテキストのみ。");
+        var contextBlock = string.IsNullOrWhiteSpace(step1SummaryJson)
+            ? "(Step1要約なし)"
+            : step1SummaryJson;
+        history.AddUserMessage($"--- Step1要約JSON（参考） ---\n{contextBlock}\n\n--- 会話履歴 ---\n{transcript}");
+
+        var response = await chat.GetChatMessageContentAsync(history, kernel: kernel, cancellationToken: ct);
+        return response?.Content?.Trim();
+    }
+
+    // Step3: 媒体/利用シーンが十分に定義されたかを評価
+    private static async Task<MediaDecision?> EvaluateMediaAsync(Kernel kernel, string transcript, string? step1SummaryJson, CancellationToken ct)
+    {
+        var chat = kernel.GetRequiredService<IChatCompletionService>();
+        var history = new ChatHistory();
+        history.AddSystemMessage(@"あなたは第三者のレビュアーです。今はステップ3『媒体／利用シーン』のみを評価します。
+            ここでいう媒体／利用シーンは、キャッチコピーがどこで・どのように使われるか（例：LPのヒーロー、駅ポスター、アプリ内バナー、メール件名 等）です。
+            会話履歴と、もしあればステップ1要約JSON内の 'usageContext' を手掛かりに、既出の情報のみから判断します。
+
+            判定基準：
+            - 媒体／利用シーンが1行で説明できること（例：特設LPのファーストビュー、店頭A1ポスター など）
+            - 既出の事実に基づくこと（推測や新規追加はしない）
+
+            出力は次のJSONのみ：
+            {
+                ""isSatisfied"": true,
+                ""mediaOrContext"": ""1行の要約（未確定なら空）"",
+                ""reason"": ""判断理由（不足点も簡潔に）""
+            }");
+        var contextBlock = string.IsNullOrWhiteSpace(step1SummaryJson)
+            ? "(Step1要約なし)"
+            : step1SummaryJson;
+        history.AddUserMessage($"--- Step1要約JSON ---\n{contextBlock}\n\n--- 会話履歴 ---\n{transcript}");
+
+        var response = await chat.GetChatMessageContentAsync(history, kernel: kernel, cancellationToken: ct);
+        var json = response?.Content?.Trim();
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            bool isSat = root.TryGetProperty("isSatisfied", out var satEl) && satEl.ValueKind == JsonValueKind.True;
+            string? media = root.TryGetProperty("mediaOrContext", out var mEl) && mEl.ValueKind == JsonValueKind.String ? mEl.GetString() : null;
+            string? reason = root.TryGetProperty("reason", out var rEl) && rEl.ValueKind == JsonValueKind.String ? rEl.GetString() : null;
+            return new MediaDecision { IsSatisfied = isSat, MediaOrContext = media, Reason = reason };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // Step3: 次の媒体確認質問を生成（既出の手がかりを活かす）
+    private static async Task<string?> GenerateNextMediaQuestionAsync(Kernel kernel, string transcript, string? step1SummaryJson, int questionCount, CancellationToken ct)
+    {
+        var chat = kernel.GetRequiredService<IChatCompletionService>();
+        var history = new ChatHistory();
+        var pacing = questionCount >= 2
+            ? "（質問が続いているため、深掘りは控えめに。2〜3個の選択肢を各1行で示し、『どれが近い？／他にありますか？』とだけ確認）"
+            : string.Empty;
+        history.AddSystemMessage(@$"あなたはやさしく話すマーケティングのプロです。工程名は出さず、自然な対話で『媒体／利用シーン』だけを確かめます。
+            既出の手がかり（Step1要約のusageContext、会話内の記述）を尊重し、重複確認は手短に。許可ベースで短く1つだけ質問してください{pacing}。
+
+            媒体以外（目的やターゲットの再確認、表現案、制作条件など）は扱いません（別フェーズ）。
+
+            必要に応じて2〜3個の候補（各1行）を示し、『どれが近いですか？／他にありますか？』と軽く確認するのはOKです。
+
+            出力はユーザーにそのまま見せる日本語のテキストのみ。");
+        var contextBlock = string.IsNullOrWhiteSpace(step1SummaryJson)
+            ? "(Step1要約なし)"
+            : step1SummaryJson;
+        history.AddUserMessage($"--- Step1要約JSON（参考） ---\n{contextBlock}\n\n--- 会話履歴 ---\n{transcript}");
+
+        var response = await chat.GetChatMessageContentAsync(history, kernel: kernel, cancellationToken: ct);
+        return response?.Content?.Trim();
+    }
+
 
         private static async Task<EvalDecision?> EvaluatePurposeAsync(Kernel kernel, string transcript, CancellationToken ct)
     {
@@ -435,6 +696,8 @@ public class CatchphraseSkill
         };
 
         var jsonResponse = await kernel.InvokePromptAsync(prompt, arguments);
+
+        // Null チェック
         var jsonString = jsonResponse?.GetValue<string>();
         if (string.IsNullOrEmpty(jsonString))
         {
@@ -443,7 +706,7 @@ public class CatchphraseSkill
 
         // AIの判断結果を解析
         var result = JsonSerializer.Deserialize<JsonElement>(jsonString);
-        if (result.TryGetProperty("isSatisfied", out var isSatEl) && isSatEl.ValueKind == JsonValueKind.True)
+        if (result.GetProperty("isSatisfied").GetBoolean())
         {
             return "目的が明確になりました。次のステップに進みます。";
         }
@@ -464,6 +727,17 @@ public class ElicitationState
     public int Step1QuestionCount { get; set; } = 0;
     // ウェルカムメッセージを送ったかどうか（重複送信防止用）
     public bool WelcomeSent { get; set; } = false;
+    // フェーズ管理
+    public bool Step1Completed { get; set; } = false;
+    public bool Step2Completed { get; set; } = false;
+    public bool Step3Completed { get; set; } = false;
+    // Step2（ターゲット）
+    public int Step2QuestionCount { get; set; } = 0;
+    public string? FinalTarget { get; set; }
+    // Step3（媒体）
+    public int Step3QuestionCount { get; set; } = 0;
+    public string? FinalUsageContext { get; set; }
+    // Step4は未実装
 }
 
 // 評価者の判定結果
@@ -474,4 +748,22 @@ public class EvalDecision
     public string? Reason { get; set; }
 }
 
-// 複数ステップは廃止し、Step1（目的）に一本化
+// ターゲット評価結果
+public class TargetDecision
+{
+    public bool IsSatisfied { get; set; }
+    public string? Target { get; set; }
+    public string? Reason { get; set; }
+}
+
+// 媒体/利用シーンの評価結果
+public class MediaDecision
+{
+    public bool IsSatisfied { get; set; }
+    public string? MediaOrContext { get; set; }
+    public string? Reason { get; set; }
+}
+
+// Step4は未実装（Step3まで）
+
+// フロー: Step1（目的）→ Step2（ターゲット）→ Step3（媒体/利用シーン）
