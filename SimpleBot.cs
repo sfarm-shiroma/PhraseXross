@@ -15,6 +15,26 @@ public class SimpleBot : ActivityHandler
     private readonly Kernel? _kernel; // optional
     private readonly ConversationState? _conversationState;
 
+    // 将来のStep拡張に備え、Stepごとのシステムメッセージ切替を簡単にする薄い仕組み
+    private enum StepPhase
+    {
+        Step1Purpose,
+        // Step2Target,
+        // Step3Expression,
+    }
+
+    private static class PromptCatalog
+    {
+        public static string Ack(StepPhase step) => step switch
+        {
+            StepPhase.Step1Purpose => @"あなたは丁寧で軽やかなアシスタントです。以下の会話と受け取った活動目的を踏まえ、
+承知の意を短く1文だけ日本語で伝えてください。敬語は自然体で、堅すぎず、命令形や謝罪は避けます。
+禁止：目的の言い換えの羅列、評価的コメント、次の質問。
+出力はそのままユーザーに見せる1文のみ。",
+            _ => @"あなたは丁寧で軽やかなアシスタントです。以下の会話を踏まえ、要点を短く1文で伝えてください。"
+        };
+    }
+
     public SimpleBot(Kernel? kernel = null, ConversationState? conversationState = null)
     {
         _kernel = kernel;
@@ -52,119 +72,76 @@ public class SimpleBot : ActivityHandler
                 state = await accessor.GetAsync(turnContext, () => new ElicitationState(), cancellationToken);
             }
 
-            // ステップ初期化（既定は Purpose）
-            state.CurrentStep ??= Steps.Purpose;
-
             // 履歴にユーザー発話を追加
             state.History.Add($"User: {text}");
             TrimHistory(state.History, 30);
-
-            // ルーティング：ステップごとに処理
             var transcript = string.Join("\n", state.History);
-            if (state.CurrentStep == Steps.Purpose)
+
+            // Step1: 目的評価のみ
+            var eval = await EvaluatePurposeAsync(_kernel, transcript, cancellationToken);
+            if (eval != null && eval.IsSatisfied)
             {
-                // Step1: 目的評価
-                var eval = await EvaluatePurposeAsync(_kernel, transcript, cancellationToken);
-                if (eval != null && eval.IsSatisfied)
+                // 目的が十分に引き出せたと判断された場合
+
+                state.FinalPurpose = string.IsNullOrWhiteSpace(eval.Purpose) ? state.FinalPurpose : eval.Purpose;
+                var purposeText = state.FinalPurpose ?? eval.Purpose ?? "(未取得)";
+
+                // 要約生成（JSON）→ ユーザー向け整形
+                var summaryJson = await GeneratePurposeSummaryAsync(_kernel, transcript, purposeText, cancellationToken);
+                state.Step1SummaryJson = summaryJson;
+                var summaryView = RenderPurposeSummaryForUser(summaryJson, fallbackPurpose: purposeText);
+
+                // 別バブルで送信: 1) 承知メッセージ（AI生成） 2) 要約
+                var ackMsg = await GenerateAckMessageAsync(_kernel, transcript, purposeText, cancellationToken);
+                if (string.IsNullOrWhiteSpace(ackMsg))
                 {
-                    // 目的が十分に引き出せた
-                    state.FinalPurpose = string.IsNullOrWhiteSpace(eval.Purpose) ? state.FinalPurpose : eval.Purpose;
-                    var purposeText = state.FinalPurpose ?? eval.Purpose ?? "(未取得)";
-
-                    // 要約生成（JSON）→ ユーザー向け整形
-                    var summaryJson = await GeneratePurposeSummaryAsync(_kernel, transcript, purposeText, cancellationToken);
-                    state.Step1SummaryJson = summaryJson;
-                    var summaryView = RenderPurposeSummaryForUser(summaryJson, fallbackPurpose: purposeText);
-
-                    var doneMsg = $"目的が見えてきました。\n\n— ここまでの整理 —\n{summaryView}";
-                    Console.WriteLine($"[USER_MESSAGE] {doneMsg}");
-                    await turnContext.SendActivityAsync(MessageFactory.Text(doneMsg, doneMsg), cancellationToken);
-
-                    // ステップを Target へ遷移し、最初の質問を提示
-                    state.CurrentStep = Steps.Target;
-                    var targetAsk = await GenerateNextTargetQuestionAsync(_kernel, transcript, purposeText, cancellationToken);
-                    if (string.IsNullOrWhiteSpace(targetAsk))
-                    {
-                        // 1回だけAIに再試行を委任（テンプレ固定文なし）
-                        targetAsk = await GenerateNextTargetQuestionAsync(_kernel, transcript, purposeText, cancellationToken);
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(targetAsk))
-                    {
-                        state.History.Add($"Assistant: {targetAsk}");
-                        TrimHistory(state.History, 30);
-                        Console.WriteLine($"[USER_MESSAGE] {targetAsk}");
-                        await turnContext.SendActivityAsync(MessageFactory.Text(targetAsk, targetAsk), cancellationToken);
-                    }
-
-                    // 状態保存
-                    if (_conversationState != null)
-                    {
-                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
-                        await accessor.SetAsync(turnContext, state, cancellationToken);
-                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
-                    }
-                    return;
+                    ackMsg = "承知しました。ありがとうございます。"; // フォールバックのみ最小限
                 }
+                Console.WriteLine($"[USER_MESSAGE] {ackMsg}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(ackMsg, ackMsg), cancellationToken);
 
-                // 未確定: Elicitor に次の質問を生成（Step1用）
-                var ask = await GenerateNextQuestionAsync(_kernel, transcript, state.Step1QuestionCount, cancellationToken);
-                if (string.IsNullOrWhiteSpace(ask))
+                var summaryMsg = $"— ここまでの整理 —\n{summaryView}";
+                Console.WriteLine($"[USER_MESSAGE] {summaryMsg}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(summaryMsg, summaryMsg), cancellationToken);
+
+                // 状態保存
+                if (_conversationState != null)
                 {
-                    // 1回だけAIに再試行（テンプレ固定文なし）
-                    ask = await GenerateNextQuestionAsync(_kernel, transcript, state.Step1QuestionCount, cancellationToken);
-                }
-                // Step1のみサニタイズ適用（ターゲット系禁止）
-                ask = SanitizeElicitorQuestion(ask);
-                if (!string.IsNullOrWhiteSpace(ask))
-                {
-                    state.History.Add($"Assistant: {ask}");
-                    TrimHistory(state.History, 30);
-                    // 質問回数をカウントして過度な深掘りを避ける
-                    state.Step1QuestionCount++;
-
-                    // 状態保存
-                    if (_conversationState != null)
-                    {
-                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
-                        await accessor.SetAsync(turnContext, state, cancellationToken);
-                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
-                    }
-
-                    Console.WriteLine($"[USER_MESSAGE] {ask}");
-                    await turnContext.SendActivityAsync(MessageFactory.Text(ask, ask), cancellationToken);
-                }
-                return;
-            }
-            else if (state.CurrentStep == Steps.Target)
-            {
-                // Step2: ターゲット引き出し（初期は質問のみ）
-                var purposeText = state.FinalPurpose ?? "(目的未保存)";
-                var ask = await GenerateNextTargetQuestionAsync(_kernel, transcript, purposeText, cancellationToken);
-                if (string.IsNullOrWhiteSpace(ask))
-                {
-                    // 1回だけAIに再試行（テンプレ固定文なし）
-                    ask = await GenerateNextTargetQuestionAsync(_kernel, transcript, purposeText, cancellationToken);
-                }
-                if (!string.IsNullOrWhiteSpace(ask))
-                {
-                    state.History.Add($"Assistant: {ask}");
-                    TrimHistory(state.History, 30);
-
-                    if (_conversationState != null)
-                    {
-                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
-                        await accessor.SetAsync(turnContext, state, cancellationToken);
-                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
-                    }
-
-                    Console.WriteLine($"[USER_MESSAGE] {ask}");
-                    await turnContext.SendActivityAsync(MessageFactory.Text(ask, ask), cancellationToken);
+                    var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                    await accessor.SetAsync(turnContext, state, cancellationToken);
+                    await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
                 }
                 return;
             }
 
-            // ここには通常到達しません（すべての分岐で return）。
+            // 未確定: Elicitor に次の質問を生成（Step1用）
+            var ask = await GenerateNextQuestionAsync(_kernel, transcript, state.Step1QuestionCount, cancellationToken);
+
+            if (string.IsNullOrWhiteSpace(ask))
+            {
+                // 1回だけAIに再試行（テンプレ固定文なし）
+                ask = await GenerateNextQuestionAsync(_kernel, transcript, state.Step1QuestionCount, cancellationToken);
+            }
+
+            if (!string.IsNullOrWhiteSpace(ask))
+            {
+                state.History.Add($"Assistant: {ask}");
+                TrimHistory(state.History, 30);
+                // 質問回数をカウントして過度な深掘りを避ける
+                state.Step1QuestionCount++;
+
+                // 状態保存
+                if (_conversationState != null)
+                {
+                    var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                    await accessor.SetAsync(turnContext, state, cancellationToken);
+                    await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                }
+
+                Console.WriteLine($"[USER_MESSAGE] {ask}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(ask, ask), cancellationToken);
+            }
+            return;
         }
         catch (Exception ex)
         {
@@ -176,10 +153,38 @@ public class SimpleBot : ActivityHandler
 
     protected override async Task OnConversationUpdateActivityAsync(ITurnContext<IConversationUpdateActivity> turnContext, CancellationToken cancellationToken)
     {
-        // 初回接続時のメッセージ
-    var welcomeMessage = "こんにちは。今日はどんな言葉づくりをお手伝いしましょう？差し支えなければ、使う場面をひとつ教えてください。（例：ポスター、SNS、Web など）";
-        Console.WriteLine($"[USER_MESSAGE] {welcomeMessage}");
-        await turnContext.SendActivityAsync(MessageFactory.Text(welcomeMessage, welcomeMessage), cancellationToken);
+        //初回接続時のメッセージ
+        // conversationUpdate の中でも、ユーザーが追加されたときのみウェルカムを一度だけ送る
+        var activity = turnContext.Activity;
+        var membersAdded = activity.MembersAdded;
+        var botId = activity.Recipient?.Id;
+
+        bool userJoined = membersAdded != null && membersAdded.Any(m => m.Id != null && m.Id != botId);
+        if (userJoined)
+        {
+            var welcomeMessage = "こんにちは。今日はどんな言葉づくりをお手伝いしましょう？まずは、差し支えなければ『何の活動のためのコピーか』を教えてください。（例：イベント告知／販促キャンペーン／ブランド認知／採用 など）";
+
+            if (_conversationState != null)
+            {
+                var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                var state = await accessor.GetAsync(turnContext, () => new ElicitationState(), cancellationToken);
+                if (!state.WelcomeSent)
+                {
+                    Console.WriteLine($"[USER_MESSAGE] {welcomeMessage}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(welcomeMessage, welcomeMessage), cancellationToken);
+
+                    state.WelcomeSent = true;
+                    await accessor.SetAsync(turnContext, state, cancellationToken);
+                    await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                }
+            }
+            else
+            {
+                // ConversationState 未設定の場合はガードできないため、membersAdded条件のみで送る
+                Console.WriteLine($"[USER_MESSAGE] {welcomeMessage}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(welcomeMessage, welcomeMessage), cancellationToken);
+            }
+        }
 
         await base.OnConversationUpdateActivityAsync(turnContext, cancellationToken);
     }
@@ -192,34 +197,42 @@ public class SimpleBot : ActivityHandler
         }
     }
 
+    // 目的受領時の承知メッセージをAIに1文で生成させる
+    private static async Task<string?> GenerateAckMessageAsync(Kernel kernel, string transcript, string purpose, CancellationToken ct)
+    {
+    var chat = kernel.GetRequiredService<IChatCompletionService>();
+    var history = new ChatHistory();
+    history.AddSystemMessage(PromptCatalog.Ack(StepPhase.Step1Purpose));
+        history.AddUserMessage($"--- 受領目的 ---\n{purpose}\n\n--- 会話履歴 ---\n{transcript}");
+        var response = await chat.GetChatMessageContentAsync(history, kernel: kernel, cancellationToken: ct);
+        return response?.Content?.Trim();
+    }
+
         private static async Task<EvalDecision?> EvaluatePurposeAsync(Kernel kernel, string transcript, CancellationToken ct)
     {
     var chat = kernel.GetRequiredService<IChatCompletionService>();
     var history = new ChatHistory();
-        history.AddSystemMessage(@"あなたは第三者のレビュアーです。今は『目的の明確化』ステップのみを評価します。
-ターゲット設定、商品・サービスの本質整理、表現案（キャッチコピー案）作成などは別フェーズです。
-これらには触れず、評価にも含めないでください。キャッチコピー作成における『目的』が十分に具体的かを判定してください。
+                history.AddSystemMessage(@"あなたは第三者のレビュアーです。今はステップ1『活動目的（なぜ作るのか）』のみを評価します。
+                ターゲット・表現案・商品本質などは扱いません。キャッチコピーが『どんな活動のために作られるのか』だけを見ます。
 
-内部定義（ユーザーには明示しない）として、『目的の明確化』は次の観点に十分近づくことを指します：
-1) コピーを使う場面（例：広告、Webサイト、SNS投稿、イベント告知、商品パッケージ）
-2) コピーの最終的な役割（例：認知を広げたい、購買を促したい、ブランドイメージを浸透させたい）
-3) 期待する行動（例：商品を買う、イベントに参加する、サイトを訪れる、記憶に残す）
-4) 到達したいゴールを一文で表す（例：『このコピーで、まずブランド名を覚えてもらう』）
-5) コアの理由・背景（なぜ今それをするのか／なぜこの手法［例：ポスター］なのか）
-6) 表現上の必須事項や避けたいこと（must include / must avoid）
-7) タイミング・期限・配置や制作上の制約があれば把握
+                活動目的の例：
+                - イベントを告知したい
+                - キャンペーンで売上を伸ばしたい（販促）
+                - ブランド認知を広げたい
+                - 採用活動で人を集めたい
+                - その他（上記以外）
 
-必要十分性の判定ルール：
-- 少なくとも (1)〜(4) のうち複数要素が具体化し、かつ (5) の『コアの理由・背景（なぜ今／なぜこの手法）』に触れていること。
-- (6)(7) は任意だが、明確に『未定・不明』と分かる形で扱われたなら許容。完全に触れられていない場合は不足として指摘。
-これらを満たさない場合は isSatisfied=false にしてください。
+                判定基準：
+                - 上記いずれか（または近いもの）が明確に述べられていること
+                - 活動の意図が短い一文で説明できていること
+                満たさない場合は isSatisfied=false にしてください。
 
-出力は次のJSONのみ。余計なテキストは出さないこと:
-{
-  ""isSatisfied"": true,
-  ""purpose"": ""十分に明確なら短く要約。未確定なら空文字でもよい"",
-  ""reason"": ""判断理由を簡潔に（不足している要素があれば指摘）""
-}");
+                出力は次のJSONのみ。余計なテキストは出さないこと:
+                {
+                    ""isSatisfied"": true,
+                    ""purpose"": ""活動目的を短く一文で。未確定なら空でもよい"",
+                    ""reason"": ""判断理由を簡潔に（不足があれば指摘）""
+                }");
         history.AddUserMessage($"--- 会話履歴 ---\n{transcript}");
 
         var response = await chat.GetChatMessageContentAsync(history, kernel: kernel, cancellationToken: ct);
@@ -240,48 +253,23 @@ public class SimpleBot : ActivityHandler
         }
     }
 
-        private static async Task<string?> GenerateNextQuestionAsync(Kernel kernel, string transcript, int questionCount, CancellationToken ct)
+    private static async Task<string?> GenerateNextQuestionAsync(Kernel kernel, string transcript, int questionCount, CancellationToken ct)
     {
     var chat = kernel.GetRequiredService<IChatCompletionService>();
     var history = new ChatHistory();
     var pacing = questionCount >= 2
         ? "（すでに質問が続いているため、深掘りは控えめに。2〜3個の方向性の仮説を各1行で提案し、『どれが近い？／他にありますか？』とだけ確認。畳みかけはNG）"
         : string.Empty;
-    history.AddSystemMessage(@$"あなたはやさしく話すマーケティングのプロです。工程名や段取りはユーザーに説明せず、
-自然な対話で必要な情報を引き出します。テンプレの型を押し付けず、誘導感を避け、許可ベースで尋ねます（例：『もしよければ…』『差し支えなければ…』）。
-ユーザーがターゲットや表現案など別の話題に触れても、『それも大切ですね。まず状況だけ少し教えてください——』のようにさりげなく軌道を戻し、
-目的に関する短い質問を1つだけ投げかけてください。曖昧な回答は受け止め、選択肢の例を軽く示すのは可（押し付けない）。
+        history.AddSystemMessage(@$"あなたはやさしく話すマーケティングのプロです。工程名は出さず、自然な対話で『活動目的』だけを確かめます。
+            テンプレ口調は避け、許可ベースで、短く1つだけ質問してください。質問密度は控えめにしてください{pacing}。
 
-質問密度は控えめにしてください{pacing}。『なぜ？』の連鎖や細かい詰め問いは避けます。
+            ここで整えるのは『何の活動のためのコピーか』だけです（例：イベント告知／販促キャンペーン／ブランド認知／採用 など）。
+            ターゲット像や表現案、制作条件などには触れません（別フェーズ）。
 
-内部ルール：ここでは『目的』を整えます。次の観点に近づくほど良いですが、この分類はユーザーに言いません。
-1) コピーを使う場面（例：広告、Webサイト、SNS投稿、イベント告知、商品パッケージ）
-2) コピーの最終的な役割（例：認知を広げたい、購買を促したい、ブランドイメージを浸透させたい）
-3) 期待する行動（例：商品を買う、イベントに参加する、サイトを訪れる、記憶に残す）
-4) 到達したいゴールを一文で表す（例：『このコピーで、まずブランド名を覚えてもらう』）
-5) コアの理由・背景（なぜ今それをするのか／なぜこの手法［例：ポスター］なのか）
-6) 表現上の必須事項・避けたいこと（must include / must avoid）
-7) タイミング・期限・配置や制作上の制約（あれば）
+            以下の会話を踏まえて、活動目的をはっきりさせるための短い質問を1つだけ行ってください。必要なら2〜3個の候補（各1行）を示し、
+            『どれが近いですか？／他にありますか？』と軽く確認するのはOKです。
 
-以下の会話を踏まえて、目的をはっきりさせるために、短く1つだけ質問してください。専門用語は避け、
-日常の言い回しで。必要に応じて“仮の一文”や“方向性の仮説を2〜3個（各1行）”を示し、『こんな感じでしょうか？』と軽く確認してもOKです（断定しない）。
-
-禁止・NG（質問に含めない）:
-- 「誰に」「どんな人」「ターゲット」「対象」「◯◯向け」「年齢」「性別」「属性」「居住地域」「職業」「層」「ペルソナ」など、
-  人物像・属性・セグメントに関する質問（これらは後続ステップで扱います。今は目的だけに集中してください。）
-
-質問のヒント（必要に応じて1つ選んで質問）：
-- どんな場面でこの言葉を使いますか？（例：ポスター、SNS、会場アナウンス など）
-- このコピーは最終的にどんな働きをしてほしいですか？（例：まず知ってもらう／行動を後押しする など）
-- 見たあとに、どんな行動をしてほしいですか？（ざっくりでOK）
-- 一言で言うと、何ができたら成功ですか？（一文で）
-- 差し支えなければ、今回は『なぜ今』取り組むのか教えてもらえますか？（背景・きっかけ）
-- もしポスターを選んだ理由があれば教えてください（他の手段ではなくポスターにした訳）
-- これだけは入れたい／避けたい表現はありますか？（例：NGワード、トーンの注意）
-- 時期や掲出場所・サイズなど、決まっている条件はありますか？（ざっくりでOK）
-
- 出力はユーザーにそのまま見せる日本語テキストだけ。前置きやルール説明、工程名は書かないでください。質問は1つ。許可ベース・選択肢例はOK。
-");
+            出力はユーザーにそのまま見せる日本語のテキストのみ。");
         history.AddUserMessage($"--- 会話履歴 ---\n{transcript}");
 
         var response = await chat.GetChatMessageContentAsync(history, kernel: kernel, cancellationToken: ct);
@@ -292,40 +280,34 @@ public class SimpleBot : ActivityHandler
         private static async Task<string> GeneratePurposeSummaryAsync(Kernel kernel, string transcript, string purpose, CancellationToken ct)
     {
         var chat = kernel.GetRequiredService<IChatCompletionService>();
-        var history = new ChatHistory();
-                                history.AddSystemMessage(@"あなたは第三者のレビュアー兼まとめ役です。今は『目的の明確化』ステップの成果を、
-ユーザーに見せる要約（JSON）にまとめます。事実のみを使い、推測や創作はしません。ユーザーに分類を意識させる必要はありません。
+                var history = new ChatHistory();
+                history.AddSystemMessage(@"あなたは第三者のレビュアー兼まとめ役です。今はステップ1『活動目的』を中心に、会話中に『既に出ている情報』だけを静かに拾って要約（JSON）に整えます。
+                    重要: ユーザーに追加質問はしません。推測や創作は厳禁。会話に現れていない項目は空/空配列にしてください。
 
-内部定義：『目的の明確化』は次の観点を指します（欠けていても可）。
-1) 使用場面 2) 最終的な役割 3) 期待する行動 4) 到達ゴール（一文） 5) コアの理由・背景 6) 必須/NG 7) タイミング・制約
+                    特に、会話中に出ていれば次を拾います：
+                    - どんな媒体/利用シーン（例: ランディングページ、ポスター 等）
+                    - 対象・主役（例: 製品名、サービス、イベント名 など）
+                    - 大枠ターゲット（例: 学生、既存顧客、来場見込み者 など）
+                    - 達成したい効果の種類（ゴールイメージ）
 
-もし他ステップ（ターゲット/本質/表現案）に関わる情報が会話に出ていれば、reference として別枠に記録します。
-出力は次のJSONのみ：
-{
-  ""purpose"": ""最終的な目的の要約（1行）"",
-  ""usageContext"": ""判明していれば1行（なければ空）"",
-  ""finalRole"": ""判明していれば1行（なければ空）"",
-  ""expectedAction"": ""判明していれば1行（なければ空）"",
-  ""oneSentenceGoal"": ""可能なら一文（なければ空）"",
-    ""coreDriver"": ""なぜ今／なぜこの手法（例：ポスター）なのか。背景やきっかけ（なければ空）"",
-    ""mustInclude"": [""入れたい要素（なければ空配列）""],
-    ""mustAvoid"": [""避けたい要素（なければ空配列）""],
-    ""timingOrConstraints"": ""時期・期限・掲出条件・制作上の制約など（なければ空）"",
-  ""references"": {
-    ""targetHints"": [""出ていれば箇条書き""],
-    ""essenceHints"": [""出ていれば箇条書き""],
-    ""expressionHints"": [""出ていれば箇条書き""]
-  },
-  ""gaps"": [""不足している点（なければ空配列）""],
-    ""confidence"": 0.0,
-    ""reviewer"": {
-        ""evaluation"": ""目的の充足度に関する短い所見（ユーザーに直接は見せない）"",
-        ""missingPoints"": [""不足/曖昧な点（例：使用場面が不明確）""],
-        ""discomfortSignals"": [""ユーザーが不快に感じていそうな兆し（あれば）""],
-        ""guidanceForNextAI"": ""次のAI（質問をする側）への注意や配慮（ユーザーには見せない）""
-    }
-}
-");
+                    出力は次のJSONのみ：
+                    {
+                        ""purpose"": ""活動目的を一文で（例：学園祭の来場を増やすためのイベント告知）"",
+                        ""usageContext"": ""（任意）媒体/利用シーンが分かれば1行、なければ空"",
+                        ""subjectOrHero"": ""（任意）対象・主役が分かれば1行、なければ空"",
+                        ""audience"": ""（任意）大枠ターゲットが分かれば1行、なければ空"",
+                        ""finalRole"": ""（空で可）"",
+                        ""expectedAction"": ""（任意）達成したい効果/期待する行動（例: 訪問/申込/来場 等）"",
+                        ""oneSentenceGoal"": ""（任意）ゴールイメージを短い一文に"",
+                        ""coreDriver"": ""（空で可）"",
+                        ""mustInclude"": [],
+                        ""mustAvoid"": [],
+                        ""timingOrConstraints"": """",
+                        ""references"": { ""targetHints"": [], ""essenceHints"": [], ""expressionHints"": [] },
+                        ""gaps"": [],
+                        ""confidence"": 0.0,
+                        ""reviewer"": { ""evaluation"": ""短い所見"", ""missingPoints"": [], ""discomfortSignals"": [], ""guidanceForNextAI"": """" }
+                    }");
         history.AddUserMessage($"--- 目的（判定済み） ---\n{purpose}\n\n--- 会話履歴 ---\n{transcript}");
 
         var response = await chat.GetChatMessageContentAsync(history, kernel: kernel, cancellationToken: ct);
@@ -343,6 +325,8 @@ public class SimpleBot : ActivityHandler
             string GetS(string name) => r.TryGetProperty(name, out var el) && el.ValueKind == JsonValueKind.String ? (el.GetString() ?? "") : "";
             string purpose = GetS("purpose");
             string usage = GetS("usageContext");
+            string subject = GetS("subjectOrHero");
+            string audience = GetS("audience");
             string role = GetS("finalRole");
             string action = GetS("expectedAction");
             string goal = GetS("oneSentenceGoal");
@@ -374,7 +358,9 @@ public class SimpleBot : ActivityHandler
 
             var lines = new List<string>();
             lines.Add($"目的: {(string.IsNullOrWhiteSpace(purpose) ? fallbackPurpose : purpose)}");
-            if (!string.IsNullOrWhiteSpace(usage)) lines.Add($"使用場面: {usage}");
+            if (!string.IsNullOrWhiteSpace(usage)) lines.Add($"媒体／利用シーン: {usage}");
+            if (!string.IsNullOrWhiteSpace(subject)) lines.Add($"対象・主役: {subject}");
+            if (!string.IsNullOrWhiteSpace(audience)) lines.Add($"大枠ターゲット: {audience}");
             if (!string.IsNullOrWhiteSpace(role)) lines.Add($"最終的な役割: {role}");
             if (!string.IsNullOrWhiteSpace(action)) lines.Add($"期待する行動: {action}");
             if (!string.IsNullOrWhiteSpace(goal)) lines.Add($"到達ゴール（一文）: {goal}");
@@ -395,98 +381,6 @@ public class SimpleBot : ActivityHandler
         {
             return $"目的: {fallbackPurpose}";
         }
-    }
-
-    // Step2（ターゲット）質問生成
-    private static async Task<string?> GenerateNextTargetQuestionAsync(Kernel kernel, string transcript, string purpose, CancellationToken ct)
-    {
-        var chat = kernel.GetRequiredService<IChatCompletionService>();
-        var history = new ChatHistory();
-        // レビュアーの所見（あれば）を次のAIプロンプトに注入する準備
-        string? reviewerNote = ExtractReviewerNoteFromTranscript(transcript);
-    var systemHeader = @"あなたはやさしく話すマーケティングのプロです。工程名はユーザーに見せず、
-自然な対話で“相手像”を絞る手助けをします。テンプレの型を押し付けず、誘導感を避け、許可ベースで尋ねます。
-ユーザーが別の話題に触れても、『ありがとうございます。相手像を少しだけ教えてください——』のようにやわらかく戻し、短い質問を1つだけしてください。
-
-もしユーザーが『くどい』『細かい』などのサインを出したら、質問は控えめにして、仮の相手像を1〜3行で提案し『ざっくりこんなイメージで大丈夫？（違っていれば一言だけ補足ください）』とだけ確認してください。
-
-出力はユーザーにそのまま見せる日本語テキストのみ。前置きやルール説明は書かないこと。質問は1つ。許可ベース・例示はOK。
-
-聞き方の例：
-- どんな人に届くと良さそうですか？
-- どんな特徴の人を想定していますか？（例：近隣に住む家族連れ、学生、地域のシニア など）
-- 今回は特に来てほしい人はいますか？（ざっくりでOK）
-";
-        if (!string.IsNullOrWhiteSpace(reviewerNote))
-        {
-            systemHeader += "\n\n[内部メモ（ユーザーに見せない）]\n" + reviewerNote + "\n";
-        }
-        history.AddSystemMessage(systemHeader);
-        history.AddUserMessage($"— 目的 —\n{purpose}\n\n— 会話履歴 —\n{transcript}");
-        var response = await chat.GetChatMessageContentAsync(history, kernel: kernel, cancellationToken: ct);
-        return response?.Content?.Trim();
-    }
-
-    // transcript内の直近の要約JSONから reviewer を抽出し、次AI用の注意メモを生成
-    private static string? ExtractReviewerNoteFromTranscript(string transcript)
-    {
-        // 直近期のJSONブロックを雑に抽出して解析（厳密なパースは不要。例外安全に）
-        try
-        {
-            // 最後に現れる '{' から終端 '}' までを拾ってJSONとして試験的に読む
-            int start = transcript.LastIndexOf('{');
-            int end = transcript.LastIndexOf('}');
-            if (start >= 0 && end > start)
-            {
-                var json = transcript.Substring(start, end - start + 1);
-                using var doc = JsonDocument.Parse(json);
-                var root = doc.RootElement;
-                if (root.TryGetProperty("reviewer", out var rev) && rev.ValueKind == JsonValueKind.Object)
-                {
-                    var eval = rev.TryGetProperty("evaluation", out var e) && e.ValueKind == JsonValueKind.String ? e.GetString() : null;
-                    var guidance = rev.TryGetProperty("guidanceForNextAI", out var g) && g.ValueKind == JsonValueKind.String ? g.GetString() : null;
-                    var missing = rev.TryGetProperty("missingPoints", out var m) && m.ValueKind == JsonValueKind.Array ? string.Join("; ", m.EnumerateArray().Select(x => x.GetString()).Where(s => !string.IsNullOrWhiteSpace(s))) : null;
-                    var discomfort = rev.TryGetProperty("discomfortSignals", out var d) && d.ValueKind == JsonValueKind.Array ? string.Join("; ", d.EnumerateArray().Select(x => x.GetString()).Where(s => !string.IsNullOrWhiteSpace(s))) : null;
-
-                    var parts = new List<string>();
-                    if (!string.IsNullOrWhiteSpace(eval)) parts.Add($"所見: {eval}");
-                    if (!string.IsNullOrWhiteSpace(missing)) parts.Add($"不足/曖昧: {missing}");
-                    if (!string.IsNullOrWhiteSpace(discomfort)) parts.Add($"不快の兆し: {discomfort}");
-                    if (!string.IsNullOrWhiteSpace(guidance)) parts.Add($"次AIへの配慮: {guidance}");
-                    return parts.Count > 0 ? string.Join("\n", parts) : null;
-                }
-            }
-        }
-        catch { /* 失敗しても無視（注入しない） */ }
-        return null;
-    }
-
-    // Elicitorの出力をスコープ遵守に補正するガード
-    private static string SanitizeElicitorQuestion(string? ask)
-    {
-        var s = (ask ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(s))
-        {
-            return "このポスターで何が起きたら『うまくいった』と言えそうですか？（ざっくりでOK）";
-        }
-
-        string[] banned = new[]
-        {
-            "誰に","どんな人","ターゲット","対象","向け","年齢","性別","属性","居住","地域の人","職業","層","ペルソナ"
-        };
-
-        foreach (var b in banned)
-        {
-            if (s.Contains(b, StringComparison.OrdinalIgnoreCase))
-            {
-                // ターゲット系に触れていれば安全な質問に差し替え
-                return "どんな場面でこの言葉を使いますか？（例：ポスター、SNS、会場アナウンス など）";
-            }
-        }
-
-        // 長すぎる出力は切り詰め（安全側）
-        if (s.Length > 120) s = s.Substring(0, 120);
-        return s;
     }
 }
 
@@ -525,15 +419,15 @@ public class CatchphraseSkill
         }
 
         // 直接プロンプトで評価（グローバル関数登録なし・重複回避）
-                var prompt = @"あなたはマーケティングのプロです。以下のユーザー入力が
-キャッチコピー作成の『目的』として十分に明確かを評価してください。
-次のJSONで返答してください（余計なテキストは出力しない）：
-{
-    ""isSatisfied"": true,
-    ""reason"": ""短い説明""
-}
+        var prompt = @"あなたはマーケティングのプロです。以下のユーザー入力が
+            キャッチコピー作成の『目的』として十分に明確かを評価してください。
+            次のJSONで返答してください（余計なテキストは出力しない）：
+            {
+                ""isSatisfied"": true,
+                ""reason"": ""短い説明""
+            }
 
-ユーザー入力: {{$input}}";
+            ユーザー入力: {{$input}}";
 
         var arguments = new KernelArguments
         {
@@ -541,8 +435,6 @@ public class CatchphraseSkill
         };
 
         var jsonResponse = await kernel.InvokePromptAsync(prompt, arguments);
-
-        // Null チェック
         var jsonString = jsonResponse?.GetValue<string>();
         if (string.IsNullOrEmpty(jsonString))
         {
@@ -551,7 +443,7 @@ public class CatchphraseSkill
 
         // AIの判断結果を解析
         var result = JsonSerializer.Deserialize<JsonElement>(jsonString);
-        if (result.GetProperty("isSatisfied").GetBoolean())
+        if (result.TryGetProperty("isSatisfied", out var isSatEl) && isSatEl.ValueKind == JsonValueKind.True)
         {
             return "目的が明確になりました。次のステップに進みます。";
         }
@@ -567,10 +459,11 @@ public class ElicitationState
 {
     public List<string> History { get; } = new List<string>();
     public string? FinalPurpose { get; set; }
-    public Steps? CurrentStep { get; set; }
     public string? Step1SummaryJson { get; set; }
     // Step1の質問回数（くどさを抑えるためのペース制御）
     public int Step1QuestionCount { get; set; } = 0;
+    // ウェルカムメッセージを送ったかどうか（重複送信防止用）
+    public bool WelcomeSent { get; set; } = false;
 }
 
 // 評価者の判定結果
@@ -581,10 +474,4 @@ public class EvalDecision
     public string? Reason { get; set; }
 }
 
-public enum Steps
-{
-    Purpose,
-    Target,
-    Essence,
-    Expression
-}
+// 複数ステップは廃止し、Step1（目的）に一本化
