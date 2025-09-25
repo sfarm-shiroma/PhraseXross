@@ -106,22 +106,29 @@ public class OneDriveExcelService
                 }
                 try { uploadedCallback?.Report(webUrl); } catch { /* ignore */ }
 
-                // fill 9x9
-                for (int r = 1; r <= 9; r++)
+                // 指定のシート（状況 / 課題・欲求 / 感情 / 温度感）を追加作成
+                var desiredSheets = new[] { "状況", "課題・欲求", "感情", "温度感" };
+                foreach (var sheetName in desiredSheets)
                 {
-                    for (int c = 1; c <= 9; c++)
+                    try
                     {
-                        string colLetter = ((char)('A' + c - 1)).ToString();
-                        string cell = colLetter + r;
-                        int val = r * c;
-                        string body = $"{{\"values\":[[\"{val}\"]]}}";
-                        var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
-                        string cellUrl = $"https://graph.microsoft.com/v1.0/me/drive/items/{itemId}/workbook/worksheets('Sheet1')/range(address='{cell}')";
-                        var patchRes = await SendWithRetry(() => http.PatchAsync(cellUrl, content, ct), ct);
-                        if (!patchRes.IsSuccessStatusCode)
+                        var addUrl = $"https://graph.microsoft.com/v1.0/me/drive/items/{itemId}/workbook/worksheets";
+                        var body = $"{{\"name\":\"{sheetName}\"}}";
+                        using var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+                        var addRes = await SendWithRetry(() => http.PostAsync(addUrl, content, ct), ct);
+                        if (!addRes.IsSuccessStatusCode)
                         {
-                            _logger.LogWarning("Cell {Cell} update failed {Status}", cell, patchRes.StatusCode);
+                            var respText = await addRes.Content.ReadAsStringAsync(ct);
+                            _logger.LogWarning("Worksheet create failed ({Sheet}) {Status}: {Resp}", sheetName, addRes.StatusCode, respText);
                         }
+                        else
+                        {
+                            _logger.LogInformation("Worksheet '{Sheet}' created", sheetName);
+                        }
+                    }
+                    catch (Exception exSheet)
+                    {
+                        _logger.LogWarning(exSheet, "Worksheet create exception for {Sheet}", sheetName);
                     }
                 }
 

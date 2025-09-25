@@ -781,25 +781,28 @@ public class SimpleBot : ActivityHandler
         string? constraintOther,
         CancellationToken ct)
     {
+        // === 新方式: 直接 JSON を生成させる ===
         var history = new ChatHistory();
-    history.AddSystemMessage(@"あなたは日本語のコピーライティング支援アシスタントです。以下の確定情報（目的/ターゲット/媒体/コア価値）と会話履歴を基に、
-キャッチコピー発想を広げるための『要素アイデア』を 4 カテゴリそれぞれ5個ずつ列挙してください。
+                        history.AddSystemMessage("""
+        あなたは日本語コピーライティング支援アシスタントです。以下の確定情報を踏まえて
+        『要素アイデア』を JSON 形式のみで出力してください。余計な説明やコードフェンス、前後テキストは禁止です。
 
-カテゴリ: 1) 状況（コンテキスト） 2) 課題・欲求（インサイト） 3) 感情 4) トーン＆キャラクターおよび温度感
+        JSON スキーマ（厳守）例:
+        {
+            "状況": [ "例1", "例2", "例3", "例4", "例5" ],
+            "課題・欲求": [ "例1", "例2", "例3", "例4", "例5" ],
+            "感情": [ "例1", "例2", "例3", "例4", "例5" ],
+            "温度感": [ "例1", "例2", "例3", "例4", "例5" ]
+        }
 
-統合カテゴリ(4)では「語り口・人格的ニュアンス（例：親しげ／凛とした／遊び心）」と「熱量・テンション（例：情熱的／静かに高揚／ワクワク）」を組み合わせ、
-各アイデアが両面（キャラクターと熱量）の雰囲気を同時に想起できる短い表現にしてください。
+        ガイド:
+        - 既出情報と矛盾する具体名や数字を作らない
+        - 類似や言い換え重複を避け幅を出す
+        - 各配列は必ず 5 要素（不足や過剰禁止）
+        - 並び順は意味的に自然なら自由
 
-ルール:
-- 既出情報を土台にしつつ、創造的なバリエーションを短く（最大15文字程度）
-- 事実と矛盾する新規の具体数値や固有名詞は避ける
-- 似通う語を避け、角度を変えた幅を出す
-- 出力は以下フォーマットのみ。余計な前置きや解説は入れない。
-
-出力フォーマット（例）:
-【状況】\n- 〇〇\n- 〇〇 ...（計5行）\n\n【課題・欲求】\n- 〇〇 ...（計5行）\n\n【感情】\n- 〇〇 ...（計5行）\n\n【トーン＆キャラクターおよび温度感】\n- 〇〇 ...（計5行）
-
-※ 箇条書きは先頭を「- 」で始める。");
+        出力は上記 JSON オブジェクトそのもの。先頭/末尾の空行、説明文、コードフェンス禁止。
+        """);
 
     var ctxLines = new List<string>();
         if (!string.IsNullOrWhiteSpace(finalPurpose)) ctxLines.Add($"目的: {finalPurpose}");
@@ -813,8 +816,46 @@ public class SimpleBot : ActivityHandler
         if (!string.IsNullOrWhiteSpace(step1SummaryJson)) ctxLines.Add($"(Step1要約JSONあり)");
 
         history.AddUserMessage($"--- 確定情報 ---\n{string.Join("\n", ctxLines)}\n\n--- 会話履歴 ---\n{transcript}");
-    var response = await InvokeAndLogAsync(kernel, history, ct, "S6/ELEMENTS:GEN");
-        return response?.Content?.Trim();
+        var response = await InvokeAndLogAsync(kernel, history, ct, "S6/ELEMENTS:GEN");
+        var raw = response?.Content?.Trim();
+        if (string.IsNullOrWhiteSpace(raw)) return raw;
+
+        // 1) 直接 JSON パース試行
+        Dictionary<string, List<string>>? dict = TryParseCreativeElementsJson(raw);
+        if (dict == null)
+        {
+            // 2) フェンス等除去再試行
+            var cleaned = StripFences(raw);
+            dict = TryParseCreativeElementsJson(cleaned);
+        }
+        if (dict == null)
+        {
+            // 3) 旧スタイル（箇条書き）フォールバックパース
+            dict = ParseCreativeElementsToSimpleJson(raw);
+        }
+
+        if (dict != null)
+        {
+            try
+            {
+                var json = JsonSerializer.Serialize(dict, new JsonSerializerOptions { WriteIndented = true });
+                var exportDir = Path.Combine(AppContext.BaseDirectory, "exports");
+                Directory.CreateDirectory(exportDir);
+                var fileName = $"creative_elements_{DateTime.UtcNow:yyyyMMdd_HHmmss}.json";
+                var path = Path.Combine(exportDir, fileName);
+                File.WriteAllText(path, json, System.Text.Encoding.UTF8);
+                Console.WriteLine($"[STEP6_JSON_SAVED] {path}");
+                // 人間向けにレンダリングして返す
+                return RenderCreativeElementsForUser(dict);
+            }
+            catch (Exception exWrite)
+            {
+                Console.WriteLine($"[STEP6_JSON_WRITE_ERROR] {exWrite.Message}");
+                return RenderCreativeElementsForUser(dict); // 保存失敗でも表示は行う
+            }
+        }
+        Console.WriteLine("[STEP6_JSON_TOTAL_FAIL] JSON/旧形式いずれも解析不可 -> 生raw返却");
+        return raw; // 最悪そのまま
     }
 
 
@@ -1276,6 +1317,121 @@ public class SimpleBot : ActivityHandler
         {
             Console.ForegroundColor = prev;
         }
+    }
+
+    // Step6 生成テキストをシンプルJSON { "状況":[], "課題・欲求":[], "感情":[], "温度感":[] } に変換
+    private static Dictionary<string, List<string>>? ParseCreativeElementsToSimpleJson(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var dict = new Dictionary<string, List<string>>
+        {
+            ["状況"] = new List<string>(),
+            ["課題・欲求"] = new List<string>(),
+            ["感情"] = new List<string>(),
+            ["温度感"] = new List<string>()
+        };
+
+        string? current = null;
+        var lines = raw.Replace("\r", string.Empty).Split('\n');
+        var categoryMap = new Dictionary<string, string>
+        {
+            ["状況"] = "状況",
+            ["課題・欲求"] = "課題・欲求",
+            ["感情"] = "感情",
+            ["温度感"] = "温度感",
+            ["トーン＆キャラクターおよび温度感"] = "温度感" // 旧名称互換
+        };
+
+        foreach (var rawLine in lines)
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0) continue; // 空行はスキップ
+
+            // カテゴリ見出し (【...】)
+            if (line.StartsWith("【") && line.EndsWith("】"))
+            {
+                var name = line.Trim('【', '】').Trim();
+                if (categoryMap.TryGetValue(name, out var mapped))
+                {
+                    current = mapped;
+                }
+                else
+                {
+                    current = null; // 未知カテゴリは無視
+                }
+                continue;
+            }
+
+            if (current == null) continue;
+
+            // 先頭の箇条書き記号除去
+            string content = line;
+            if (content.StartsWith("- ")) content = content.Substring(2).Trim();
+            else if (content.StartsWith("・")) content = content.Substring(1).Trim();
+            else if (content.StartsWith("-")) content = content.Substring(1).Trim();
+            if (content.Length == 0) continue;
+            dict[current].Add(content);
+        }
+
+        // 1カテゴリも埋まっていなければ失敗扱い
+        if (dict.All(kv => kv.Value.Count == 0)) return null;
+        return dict;
+    }
+
+    private static string StripFences(string text)
+    {
+        var t = text.Trim();
+        if (t.StartsWith("```"))
+        {
+            var nl = t.IndexOf('\n');
+            if (nl > 0) t = t.Substring(nl + 1).Trim();
+            var last = t.LastIndexOf("```", StringComparison.Ordinal);
+            if (last >= 0) t = t.Substring(0, last).Trim();
+        }
+        return t;
+    }
+
+    private static Dictionary<string, List<string>>? TryParseCreativeElementsJson(string raw)
+    {
+        try
+        {
+            var doc = JsonDocument.Parse(raw);
+            var root = doc.RootElement;
+            string[] keys = { "状況", "課題・欲求", "感情", "温度感" };
+            var dict = new Dictionary<string, List<string>>();
+            foreach (var k in keys)
+            {
+                if (!root.TryGetProperty(k, out var arr) || arr.ValueKind != JsonValueKind.Array) return null;
+                var list = new List<string>();
+                foreach (var el in arr.EnumerateArray())
+                {
+                    if (el.ValueKind == JsonValueKind.String)
+                    {
+                        var v = el.GetString();
+                        if (!string.IsNullOrWhiteSpace(v)) list.Add(v!.Trim());
+                    }
+                }
+                if (list.Count != 5) return null; // 厳格: 必ず5件
+                dict[k] = list;
+            }
+            return dict;
+        }
+        catch { return null; }
+    }
+
+    private static string RenderCreativeElementsForUser(Dictionary<string, List<string>> dict)
+    {
+        string Format(string label) => dict.TryGetValue(label, out var list) && list.Count > 0
+            ? "【" + label + "】\n- " + string.Join("\n- ", list)
+            : "";
+        var parts = new List<string?>
+        {
+            Format("状況"),
+            Format("課題・欲求"),
+            Format("感情"),
+            Format("温度感")
+        }.Where(s => !string.IsNullOrWhiteSpace(s));
+        return string.Join("\n\n", parts);
     }
 
     // コードフェンスや余計な前後文を含むLLM出力から最初のJSONオブジェクトを抽出
