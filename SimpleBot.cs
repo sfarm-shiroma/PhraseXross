@@ -693,7 +693,7 @@ public class SimpleBot : ActivityHandler
     private static async Task<string?> GenerateNextTargetQuestionAsync(Kernel kernel, string transcript, string? step1SummaryJson, int questionCount, CancellationToken ct)
     {
         var history = new ChatHistory();
-        var pacing = questionCount >= 2
+        var pacing = questionCount >= 4
             ? "（質問が続いているため、深掘りは控えめに。2〜3個の選択肢を各1行で示し、『どれが近い？／他にありますか？』とだけ確認）"
             : string.Empty;
         history.AddSystemMessage(@$"あなたはやさしく話すマーケティングのプロです。工程名は出さず、自然な対話で『ターゲット』だけを確かめます。
@@ -747,7 +747,7 @@ public class SimpleBot : ActivityHandler
     private static async Task<string?> GenerateNextMediaQuestionAsync(Kernel kernel, string transcript, string? step1SummaryJson, int questionCount, CancellationToken ct)
     {
         var history = new ChatHistory();
-        var pacing = questionCount >= 2
+        var pacing = questionCount >= 4
             ? "（質問が続いているため、深掘りは控えめに。2〜3個の選択肢を各1行で示し、『どれが近い？／他にありますか？』とだけ確認）"
             : string.Empty;
         history.AddSystemMessage(@$"あなたはやさしく話すマーケティングのプロです。工程名は出さず、自然な対話で『媒体／利用シーン』だけを確かめます。
@@ -960,10 +960,18 @@ public class SimpleBot : ActivityHandler
         CancellationToken ct)
     {
         var history = new ChatHistory();
-        var pacing = questionCount >= 2 ? "（質問が続いているため簡潔に。YES/NOか選択肢提示で手短に）" : string.Empty;
+    var pacing = questionCount >= 4 ? "（質問が続いているため簡潔に。YES/NOか選択肢提示で手短に）" : string.Empty;
         history.AddSystemMessage(@$"あなたは丁寧なコピー制作アシスタントです。今は『制約事項』（文字数 / 文化・配慮 / 法規・レギュレーション / その他）だけを確認します。
         既出を繰り返しすぎない。新規に想像で条件を作らない。{pacing}
-        出力は次の1質問のみ（日本語）。");
+
+        厳守ルール:
+        - 出力は必ず 1 つの質問文（疑問符 ? または ？ を含む）
+        - 'YES' や 'はい' などの了承単語のみを返してはいけない
+        - 箇条書きは最大 1 行に留め、冗長な前置き禁止
+        - まだ未確定/空のカテゴリだけを明示的に軽く聞くのは OK
+        - 追加が無ければ『特になし』と答えてください、のような誘導を含めてもよい
+
+        出力は質問文 1 行のみ（説明・コードフェンス禁止）。");
         var ctx = new List<string>();
         if (!string.IsNullOrWhiteSpace(step1SummaryJson)) ctx.Add(step1SummaryJson!);
         if (!string.IsNullOrWhiteSpace(finalTarget)) ctx.Add($"[Target]{finalTarget}");
@@ -971,7 +979,45 @@ public class SimpleBot : ActivityHandler
         if (!string.IsNullOrWhiteSpace(finalCoreValue)) ctx.Add($"[Core]{finalCoreValue}");
         history.AddUserMessage($"--- コンテキスト（参考） ---\n{string.Join("\n", ctx)}\n\n--- 会話履歴 ---\n{transcript}");
     var response = await InvokeAndLogAsync(kernel, history, ct, "S5/CONSTRAINTS:Q");
-        return response?.Content?.Trim();
+        var text = response?.Content?.Trim();
+        if (IsInvalidConstraintQuestion(text))
+        {
+            // 1回だけ再試行: 直前出力が不正だったことを明示
+            var retry = new ChatHistory();
+            retry.AddSystemMessage(@"前回あなたは 'YES' など無効な応答を返しました。禁止された形式です。必ず 1 つの有効な質問を作成してください。");
+            foreach (var m in history) retry.Add(m); // 元履歴を付与
+            var second = await InvokeAndLogAsync(kernel, retry, ct, "S5/CONSTRAINTS:Q-RETRY");
+            var secondText = second?.Content?.Trim();
+            if (!IsInvalidConstraintQuestion(secondText)) return secondText;
+            // フォールバック（決して YES だけにならない質問）
+            return "制約の最終確認です。文字数・文化/配慮・法規/必須表記・その他NGで追加や注意したい点はありますか？なければ『特になし』と返信してください。";
+        }
+        return text;
+    }
+
+    // 制約質問バリデーション: YES/はい 単体や疑問符無しを弾く
+    private static bool IsInvalidConstraintQuestion(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return true;
+        var t = text.Trim();
+        // シンプル了承語だけ
+        var simple = new[] { "YES", "Yes", "yes", "はい", "了解", "承知", "OK", "ok" };
+        if (simple.Contains(t)) return true;
+        // 了承語+句点のみ
+        if (simple.Any(s => t.Equals(s + "。", StringComparison.OrdinalIgnoreCase))) return true;
+        // 疑問符が無い
+        if (!t.Contains('?') && !t.Contains('？')) return true;
+        // 質問語を含まず形式だけ ? を付けた 5 文字以下 (防御的)
+        if (t.Length <= 5 && (t.EndsWith("?") || t.EndsWith("？"))) return true;
+        return false;
+    }
+
+    private static bool IsNoConstraintsUtterance(string? userText)
+    {
+        if (string.IsNullOrWhiteSpace(userText)) return false;
+        var t = userText.Trim();
+        string[] patterns = { "特にない", "特になし", "無しです", "ないです", "ありません" };
+        return patterns.Any(p => t.Contains(p, StringComparison.OrdinalIgnoreCase));
     }
 
     private static string RenderConstraintSummary(ElicitationState state)
@@ -997,7 +1043,7 @@ public class SimpleBot : ActivityHandler
         CancellationToken ct)
     {
         var history = new ChatHistory();
-        var pacing = questionCount >= 2
+        var pacing = questionCount >= 4
             ? "（質問が続いているため、深掘りは控えめに。2〜3個の仮説候補を各1行で示し、『どれが近い？／他にありますか？』とだけ確認）"
             : string.Empty;
         var reasonSnippet = string.IsNullOrWhiteSpace(evalReason) ? "" : $"直前の評価で不足とされた点: {evalReason}\n";
@@ -1064,7 +1110,7 @@ public class SimpleBot : ActivityHandler
     private static async Task<string?> GenerateNextQuestionAsync(Kernel kernel, string transcript, int questionCount, CancellationToken ct)
     {
     var history = new ChatHistory();
-    var pacing = questionCount >= 2
+    var pacing = questionCount >= 4
         ? "（すでに質問が続いているため、深掘りは控えめに。2〜3個の方向性の仮説を各1行で提案し、『どれが近い？／他にありますか？』とだけ確認。畳みかけはNG）"
         : string.Empty;
         history.AddSystemMessage(@$"あなたはやさしく話すマーケティングのプロです。工程名は出さず、自然な対話で『活動目的』だけを確かめます。
