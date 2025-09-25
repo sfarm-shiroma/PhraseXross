@@ -52,6 +52,36 @@ Web Apps に以下の環境変数を設定してください:
 
 ---
 
+## 設定方法（appsettings.* ではなく .env / 環境変数へ移行）
+
+このプロジェクトでは機密値を `appsettings.*.json` に保持せず、以下の優先順で読み込みます:
+
+1. プロセス / コンテナ環境変数 (Azure Web Apps / docker -e)
+2. 実行ディレクトリの `.env` ファイル（存在する場合のみ）
+
+`.env.example` をコピーして `.env` を作成し、必要なキーを設定してください。`.env` は `.gitignore` 済みです。
+
+主要キー一覧:
+
+- Bot: `MicrosoftAppId`, `MicrosoftAppPassword`, `MicrosoftAppTenantId`, `MicrosoftAppType`
+- Semantic Kernel (Azure OpenAI): `ENABLE_SK`, `AOAI_ENDPOINT`, `AOAI_API_KEY`, `AOAI_DEPLOYMENT`, `AOAI_API_VERSION`
+- OneDrive / Graph: `OneDriveClientId`, `OneDriveTenantId` （後方互換: 旧 `ONEDRIVE_CLIENT_ID`, `ONEDRIVE_TENANT_ID` も可）
+
+Docker 実行例（PowerShell）:
+
+```powershell
+docker run --rm -p 8080:8080 `
+   -e ENABLE_SK=true `
+   -e AOAI_ENDPOINT=https://<your-aoai>.openai.azure.com/ `
+   -e AOAI_API_KEY=<key> `
+   -e AOAI_DEPLOYMENT=gpt-4o `
+   -e MicrosoftAppId=<bot-app-id> `
+   -e MicrosoftAppPassword=<bot-secret> `
+   phrasexross:latest
+```
+
+ローカル開発では `.env` に書くだけで `Program.cs` の簡易ローダが起動時に取り込みます。
+
 ## Semantic Kernel (Azure OpenAI) 連携
 
 このボットはオプションで Semantic Kernel を使ったAI応答が可能です。無効時は従来のエコー応答になります。

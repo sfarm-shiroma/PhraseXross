@@ -3,6 +3,7 @@ using Microsoft.Bot.Schema;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.Extensions.DependencyInjection;
+using PhraseXross.Services; // OneDriveExcelService
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,17 +16,67 @@ public class SimpleBot : ActivityHandler
 {
     private readonly Kernel? _kernel; // optional
     private readonly ConversationState? _conversationState;
+    private readonly OneDriveExcelService? _oneDriveExcelService; // optional (OneDrive 連携)
 
-    public SimpleBot(Kernel? kernel = null, ConversationState? conversationState = null)
+    public SimpleBot(Kernel? kernel = null, ConversationState? conversationState = null, OneDriveExcelService? oneDriveExcelService = null)
     {
         _kernel = kernel;
         _conversationState = conversationState;
+        _oneDriveExcelService = oneDriveExcelService;
     }
 
     protected override async Task OnMessageActivityAsync(ITurnContext<IMessageActivity> turnContext, CancellationToken cancellationToken)
     {
         var text = turnContext.Activity.Text ?? string.Empty;
         Console.WriteLine($"[USER_INPUT] {text}");
+
+        // まず特定コマンドのハンドリング（他フェーズより優先）
+        if (text.Trim().Equals("/excel", StringComparison.OrdinalIgnoreCase) || text.Trim().Equals("excel", StringComparison.OrdinalIgnoreCase))
+        {
+            if (_oneDriveExcelService == null)
+            {
+                var msg = "OneDrive連携サービスが利用できません（未構成または無効）。";
+                Console.WriteLine($"[USER_MESSAGE] {msg}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(msg, msg), cancellationToken);
+                return;
+            }
+            try
+            {
+                var pre = "OneDriveにExcelを作成しています。";
+                Console.WriteLine($"[USER_MESSAGE] {pre}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(pre, pre), cancellationToken);
+
+                string? uploadedUrl = null;
+                var progress = new Progress<string>(url =>
+                {
+                    uploadedUrl = url;
+                    var upMsg = $"アップロード完了（これから内容を書き込みます）: {url}";
+                    Console.WriteLine($"[USER_MESSAGE] {upMsg}");
+                    turnContext.SendActivityAsync(MessageFactory.Text(upMsg, upMsg), cancellationToken).GetAwaiter().GetResult();
+                });
+
+                var result = await _oneDriveExcelService.CreateAndFillExcelAsync(progress, cancellationToken);
+                if (result.IsSuccess && !string.IsNullOrWhiteSpace(result.WebUrl))
+                {
+                    var done = $"Excel出力完了: {result.WebUrl}";
+                    Console.WriteLine($"[USER_MESSAGE] {done}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(done, done), cancellationToken);
+                }
+                else
+                {
+                    var err = $"Excel出力失敗: {result.Error ?? "不明なエラー"}";
+                    Console.WriteLine($"[USER_MESSAGE] {err}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(err, err), cancellationToken);
+                }
+            }
+            catch (Exception exUp)
+            {
+                var err = $"アップロード処理中に例外: {exUp.Message}";
+                Console.WriteLine($"[USER_MESSAGE] {err}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(err, err), cancellationToken);
+            }
+            return; // コマンド処理で終了
+        }
 
         if (string.IsNullOrWhiteSpace(text))
         {
@@ -370,6 +421,11 @@ public class SimpleBot : ActivityHandler
                             Console.WriteLine($"[USER_MESSAGE] {followMsg}");
                             await turnContext.SendActivityAsync(MessageFactory.Text(followMsg, followMsg), cancellationToken);
                             state.Step6Completed = true;
+                            // Step7: 自動Excel出力（可能なら）
+                            if (!state.Step7Completed)
+                            {
+                                await TryStep7ExcelAsync(turnContext, state, cancellationToken);
+                            }
                         }
                     }
 
@@ -429,6 +485,11 @@ public class SimpleBot : ActivityHandler
                     Console.WriteLine($"[USER_MESSAGE] {followMsg}");
                     await turnContext.SendActivityAsync(MessageFactory.Text(followMsg, followMsg), cancellationToken);
                     state.Step6Completed = true;
+                    // Step7: 自動Excel出力（可能なら）
+                    if (!state.Step7Completed)
+                    {
+                        await TryStep7ExcelAsync(turnContext, state, cancellationToken);
+                    }
                 }
                 if (_conversationState != null)
                 {
@@ -1261,6 +1322,55 @@ public class SimpleBot : ActivityHandler
         }
         return null;
     }
+
+    // Step7: クリエイティブ要素生成後に自動 Excel 出力（OneDrive）
+    private async Task TryStep7ExcelAsync(ITurnContext turnContext, ElicitationState state, CancellationToken cancellationToken)
+    {
+        if (_oneDriveExcelService == null)
+        {
+            var skip = "（Excel出力は未構成のためスキップしました。/excel で手動コマンド、または OneDrive 環境変数を設定してください。）";
+            Console.WriteLine($"[USER_MESSAGE] {skip}");
+            await turnContext.SendActivityAsync(MessageFactory.Text(skip, skip), cancellationToken);
+            return;
+        }
+        try
+        {
+            var pre = "OneDriveにExcelを作成しています。";
+            Console.WriteLine($"[USER_MESSAGE] {pre}");
+            await turnContext.SendActivityAsync(MessageFactory.Text(pre, pre), cancellationToken);
+
+            string? uploadedUrl = null;
+            var progress = new Progress<string>(url =>
+            {
+                uploadedUrl = url;
+                var upMsg = $"アップロード完了（これから内容を書き込みます）: {url}";
+                Console.WriteLine($"[USER_MESSAGE] {upMsg}");
+                // Fire & forget (TurnContext はスレッドセーフでないので同期呼び出し) → Task.Runせず直接待機
+                turnContext.SendActivityAsync(MessageFactory.Text(upMsg, upMsg), cancellationToken).GetAwaiter().GetResult();
+            });
+
+            var result = await _oneDriveExcelService.CreateAndFillExcelAsync(progress, cancellationToken);
+            if (result.IsSuccess && !string.IsNullOrWhiteSpace(result.WebUrl))
+            {
+                var done = $"Excel出力完了: {result.WebUrl}";
+                Console.WriteLine($"[USER_MESSAGE] {done}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(done, done), cancellationToken);
+                state.Step7Completed = true;
+            }
+            else
+            {
+                var err = $"Excel出力失敗: {result.Error ?? "不明なエラー"}";
+                Console.WriteLine($"[USER_MESSAGE] {err}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(err, err), cancellationToken);
+            }
+        }
+        catch (Exception ex)
+        {
+            var err = $"Excel出力中に例外: {ex.Message}";
+            Console.WriteLine($"[USER_MESSAGE] {err}");
+            await turnContext.SendActivityAsync(MessageFactory.Text(err, err), cancellationToken);
+        }
+    }
 }
 
 public class CatchphraseSkill
@@ -1352,6 +1462,7 @@ public class ElicitationState
     public bool Step4Completed { get; set; } = false;
     public bool Step5Completed { get; set; } = false; // 制約事項（文字数/文化/法規/その他）
     public bool Step6Completed { get; set; } = false; // クリエイティブ要素自動生成
+    public bool Step7Completed { get; set; } = false; // Excel出力
     // Step2（ターゲット）
     public int Step2QuestionCount { get; set; } = 0;
     public string? FinalTarget { get; set; }

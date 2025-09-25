@@ -6,14 +6,41 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Configuration;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Connectors.AzureOpenAI;
+using Microsoft.AspNetCore.Mvc;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Load .env manually (simple parser) before building services so Environment.GetEnvironmentVariable works.
+var envFile = Path.Combine(AppContext.BaseDirectory, ".env");
+if (File.Exists(envFile))
+{
+    foreach (var line in File.ReadAllLines(envFile))
+    {
+        var trimmed = line.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed) || trimmed.StartsWith("#")) continue;
+        var idx = trimmed.IndexOf('=');
+        if (idx <= 0) continue;
+        var key = trimmed[..idx].Trim();
+        var value = trimmed[(idx + 1)..].Trim();
+        // Only set if not already set in process env
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable(key)))
+        {
+            Environment.SetEnvironmentVariable(key, value);
+        }
+    }
+}
 
 // Add services to the container.
 // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 builder.Services.AddControllers();
+// Graph API HttpClient (basic)
+builder.Services.AddHttpClient("graph", c =>
+{
+    c.Timeout = TimeSpan.FromSeconds(100);
+});
+builder.Services.AddSingleton<PhraseXross.Services.OneDriveExcelService>();
 builder.Services.AddSingleton<CloudAdapter, CloudAdapter>(sp =>
 {
     var logger = sp.GetRequiredService<ILogger<CloudAdapter>>();
@@ -80,7 +107,14 @@ builder.Services.AddSingleton<CloudAdapter, CloudAdapter>(sp =>
 
     return new CloudAdapter(botFrameworkAuthentication, logger);
 });
-builder.Services.AddTransient<IBot, SimpleBot>(); // Replace SimpleBot with your bot implementation
+// SimpleBot を DI へ登録（OneDriveExcelService, Kernel, ConversationState をオプション注入）
+builder.Services.AddTransient<IBot>(sp =>
+{
+    var kernel = sp.GetService<Kernel>();
+    var convo = sp.GetService<ConversationState>();
+    var oneDrive = sp.GetService<PhraseXross.Services.OneDriveExcelService>();
+    return new SimpleBot(kernel, convo, oneDrive);
+});
 
 // Bot State for multi-turn conversation (yes/no confirmation flow)
 builder.Services.AddSingleton<IStorage, MemoryStorage>();
@@ -138,6 +172,16 @@ app.UseHttpsRedirection();
 app.UseAuthorization();
 
 app.MapControllers();
+
+// Minimal API for triggering OneDrive Excel generation (manual test)
+app.MapPost("/onedrive/excel/generate", async ([FromServices] PhraseXross.Services.OneDriveExcelService svc, CancellationToken ct) =>
+{
+    // 進捗コールバック不要のため null を指定（新シグネチャ対応）
+    var result = await svc.CreateAndFillExcelAsync(null, ct);
+    return result.IsSuccess ? Results.Ok(new { result.WebUrl, result.FileName }) : Results.BadRequest(new { error = result.Error });
+})
+.WithName("GenerateOneDriveExcel")
+.WithOpenApi();
 
 var summaries = new[]
 {
