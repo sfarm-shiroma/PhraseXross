@@ -124,7 +124,9 @@ public class OneDriveExcelService
                     _logger.LogWarning(exList, "Failed to enumerate creative elements JSON files");
                 }
 
+                // 生成: カテゴリ名と要素配列を取得
                 List<string> categoryKeys = new();
+                Dictionary<string, List<string>> categoryValues = new();
                 if (!string.IsNullOrWhiteSpace(latestJson) && File.Exists(latestJson))
                 {
                     try
@@ -136,7 +138,18 @@ public class OneDriveExcelService
                         {
                             if (prop.Value.ValueKind == System.Text.Json.JsonValueKind.Array)
                             {
-                                categoryKeys.Add(prop.Name.Trim());
+                                var name = prop.Name.Trim();
+                                categoryKeys.Add(name);
+                                var list = new List<string>();
+                                foreach (var el in prop.Value.EnumerateArray())
+                                {
+                                    if (el.ValueKind == System.Text.Json.JsonValueKind.String)
+                                    {
+                                        var v = el.GetString();
+                                        if (!string.IsNullOrWhiteSpace(v)) list.Add(v!.Trim());
+                                    }
+                                }
+                                categoryValues[name] = list;
                             }
                         }
                         _logger.LogInformation("Creative elements categories detected: {Cats}", string.Join(",", categoryKeys));
@@ -188,6 +201,194 @@ public class OneDriveExcelService
                     }
                 }
 
+                // 要素書き込み: A2 縦に firstCat の値, B2 から横方向に secondCat の値
+                async Task FillPairSheetAsync(string sheetName, string firstCat, string secondCat)
+                {
+                    var safe = SanitizeSheetName(sheetName);
+                    if (!categoryValues.TryGetValue(firstCat, out var firstList) || firstList.Count == 0) { _logger.LogWarning("No values for category {Cat}", firstCat); return; }
+                    if (!categoryValues.TryGetValue(secondCat, out var secondList) || secondList.Count == 0) { _logger.LogWarning("No values for category {Cat}", secondCat); return; }
+
+                    string ColLetter(int index1Based)
+                    {
+                        var dividend = index1Based;
+                        var col = string.Empty;
+                        while (dividend > 0)
+                        {
+                            var modulo = (dividend - 1) % 26;
+                            col = Convert.ToChar('A' + modulo) + col;
+                            dividend = (dividend - modulo) / 26;
+                        }
+                        return col;
+                    }
+
+                    // ヘッダー/ボディ配置仕様:
+                    // A1: 空白
+                    // B1..: secondCat の要素（横）
+                    // A2..: firstCat の要素（縦）
+                    // B2..: 交差セル  firstItem × secondItem （要望 #2）
+
+                    // 縦: A2..A(1+count)
+                    int vCount = firstList.Count;
+                    int lastRow = 1 + vCount; // 2開始 → 2..(1+count)
+                    var vertAddress = $"A2:A{lastRow}";
+                    var vertValues = firstList.Select(v => new object[] { v }).ToList();
+                    var vertBody = new { values = vertValues };
+                    var vertJson = System.Text.Json.JsonSerializer.Serialize(vertBody);
+                    var vertUrl = $"https://graph.microsoft.com/v1.0/me/drive/items/{itemId}/workbook/worksheets/{Uri.EscapeDataString(safe)}/range(address='{vertAddress}')";
+                    try
+                    {
+                        using var content = new StringContent(vertJson, System.Text.Encoding.UTF8, "application/json");
+                        var res = await SendWithRetry(() => http.PatchAsync(vertUrl, content, ct), ct);
+                        if (!res.IsSuccessStatusCode)
+                        {
+                            _logger.LogWarning("Vertical write failed {Sheet} {Status}", safe, res.StatusCode);
+                        }
+                    }
+                    catch (Exception exV)
+                    {
+                        _logger.LogWarning(exV, "Vertical write exception {Sheet}", safe);
+                    }
+
+                    // 横ヘッダー: B1..(column)1  (要素数 n → B..(B+n-1))
+                    int hCount = secondList.Count;
+                    int lastColIndex = 2 + hCount - 1; // B=2
+                    var lastColLetter = ColLetter(lastColIndex);
+                    var horizAddress = $"B1:{lastColLetter}1";
+                    var horizValues = new List<object[]> { secondList.Cast<object>().ToArray() };
+                    var horizBody = new { values = horizValues };
+                    var horizJson = System.Text.Json.JsonSerializer.Serialize(horizBody);
+                    var horizUrl = $"https://graph.microsoft.com/v1.0/me/drive/items/{itemId}/workbook/worksheets/{Uri.EscapeDataString(safe)}/range(address='{horizAddress}')";
+                    try
+                    {
+                        using var content = new StringContent(horizJson, System.Text.Encoding.UTF8, "application/json");
+                        var res = await SendWithRetry(() => http.PatchAsync(horizUrl, content, ct), ct);
+                        if (!res.IsSuccessStatusCode)
+                        {
+                            _logger.LogWarning("Horizontal write failed {Sheet} {Status}", safe, res.StatusCode);
+                        }
+                    }
+                    catch (Exception exH)
+                    {
+                        _logger.LogWarning(exH, "Horizontal write exception {Sheet}", safe);
+                    }
+
+                    // 軸セルの塗りつぶし: 縦軸(#FBE2D5), 横軸(#DAE9F8)
+                    async Task ApplyFillAsync(string address, string color)
+                    {
+                        var fillUrl = $"https://graph.microsoft.com/v1.0/me/drive/items/{itemId}/workbook/worksheets/{Uri.EscapeDataString(safe)}/range(address='{address}')/format/fill";
+                        var body = $"{{\"color\":\"{color}\"}}"; // { "color": "#XXXXXX" }
+                        try
+                        {
+                            using var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+                            var res = await SendWithRetry(() => http.PatchAsync(fillUrl, content, ct), ct);
+                            if (!res.IsSuccessStatusCode)
+                            {
+                                _logger.LogWarning("Fill color failed {Sheet} {Addr} {Status}", safe, address, res.StatusCode);
+                            }
+                        }
+                        catch (Exception exF)
+                        {
+                            _logger.LogWarning(exF, "Fill color exception {Sheet} {Addr}", safe, address);
+                        }
+                    }
+
+                    // A列 (A2..A{lastRow}) と 横ヘッダー (B1..{lastColLetter}1)
+                    await ApplyFillAsync($"A2:A{lastRow}", "#FBE2D5");
+                    await ApplyFillAsync(horizAddress, "#DAE9F8");
+
+                    // 列幅調整: A ~ lastColLetter を幅 45 に統一
+                    async Task SetColumnWidthAsync(string fromCol, string toCol, double width)
+                    {
+                        var absRange = fromCol == toCol ? $"${fromCol}:${toCol}" : $"${fromCol}:${toCol}"; // 列全体 ($A:$D)
+                        var body = $"{{\"columnWidth\":{width.ToString(System.Globalization.CultureInfo.InvariantCulture)} }}";
+                        async Task<bool> TryPatchAsync(string rangeAddress)
+                        {
+                            var url = $"https://graph.microsoft.com/v1.0/me/drive/items/{itemId}/workbook/worksheets/{Uri.EscapeDataString(safe)}/range(address='{rangeAddress}')/format";
+                            using var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+                            var res = await SendWithRetry(() => http.PatchAsync(url, content, ct), ct);
+                            if (!res.IsSuccessStatusCode)
+                            {
+                                var resp = await res.Content.ReadAsStringAsync(ct);
+                                _logger.LogWarning("Set column width failed {Sheet} {Range} {Status} {Resp}", safe, rangeAddress, res.StatusCode, resp);
+                                return false;
+                            }
+                            return true;
+                        }
+                        try
+                        {
+                            // 1) 列全体指定 ($A:$D) を試す
+                            if (!await TryPatchAsync(absRange))
+                            {
+                                // 2) フォールバック: 1行目セル範囲 ($A$1:$D$1)
+                                var row1Range = fromCol == toCol ? $"${fromCol}$1:${toCol}$1" : $"${fromCol}$1:${toCol}$1";
+                                await TryPatchAsync(row1Range);
+                            }
+                        }
+                        catch (Exception exW)
+                        {
+                            _logger.LogWarning(exW, "Set column width exception {Sheet} {From}-{To}", safe, fromCol, toCol);
+                        }
+                    }
+                    await SetColumnWidthAsync("A", lastColLetter, 200); // 視覚確認用に大きめ幅(200pt)を設定
+
+                    // 設定結果の一部を取得しログ（A列）
+                    try
+                    {
+                        var getFormatUrl = $"https://graph.microsoft.com/v1.0/me/drive/items/{itemId}/workbook/worksheets/{Uri.EscapeDataString(safe)}/range(address='$A:$A')/format";
+                        var getRes = await SendWithRetry(() => http.GetAsync(getFormatUrl, ct), ct);
+                        if (getRes.IsSuccessStatusCode)
+                        {
+                            var txt = await getRes.Content.ReadAsStringAsync(ct);
+                            using var fmtDoc = System.Text.Json.JsonDocument.Parse(txt);
+                            if (fmtDoc.RootElement.TryGetProperty("columnWidth", out var wEl) && wEl.ValueKind == System.Text.Json.JsonValueKind.Number)
+                            {
+                                _logger.LogInformation("Column A width reported by Graph: {WidthPt}pt", wEl.GetDouble());
+                            }
+                            else
+                            {
+                                _logger.LogInformation("Column A width GET succeeded but columnWidth not present: {Json}", txt);
+                            }
+                        }
+                        else
+                        {
+                            _logger.LogWarning("Column A width GET failed {Status}", getRes.StatusCode);
+                        }
+                    }
+                    catch (Exception exGW)
+                    {
+                        _logger.LogWarning(exGW, "Failed to get column width after setting");
+                    }
+
+                    // 交差セル (B2..lastColLetter lastRow): firstItem × secondItem
+                    try
+                    {
+                        var matrixAddress = $"B2:{lastColLetter}{lastRow}";
+                        var matrixValues = new List<object[]>();
+                        for (int r = 0; r < vCount; r++)
+                        {
+                            var row = new object[hCount];
+                            for (int c = 0; c < hCount; c++)
+                            {
+                                row[c] = firstList[r] + " × " + secondList[c];
+                            }
+                            matrixValues.Add(row);
+                        }
+                        var matrixBody = new { values = matrixValues };
+                        var matrixJson = System.Text.Json.JsonSerializer.Serialize(matrixBody);
+                        var matrixUrl = $"https://graph.microsoft.com/v1.0/me/drive/items/{itemId}/workbook/worksheets/{Uri.EscapeDataString(safe)}/range(address='{matrixAddress}')";
+                        using var content = new StringContent(matrixJson, System.Text.Encoding.UTF8, "application/json");
+                        var res = await SendWithRetry(() => http.PatchAsync(matrixUrl, content, ct), ct);
+                        if (!res.IsSuccessStatusCode)
+                        {
+                            _logger.LogWarning("Matrix write failed {Sheet} {Status}", safe, res.StatusCode);
+                        }
+                    }
+                    catch (Exception exM)
+                    {
+                        _logger.LogWarning(exM, "Matrix write exception {Sheet}", safe);
+                    }
+                }
+
                 var created = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 if (categoryKeys.Count > 0)
                 {
@@ -234,6 +435,8 @@ public class OneDriveExcelService
                                             {
                                                 _logger.LogInformation("Renamed Sheet1 to {NewName}", safeName);
                                                 created.Add(firstPairName); // マークして後続生成をスキップ
+                                                // リネーム成功後に要素書き込み
+                                                await FillPairSheetAsync(firstPairName, categoryKeys[0], categoryKeys[1]);
                                             }
                                             else
                                             {
@@ -260,6 +463,7 @@ public class OneDriveExcelService
                                             {
                                                 _logger.LogInformation("(Fallback) Renamed Sheet1 to {NewName}", safeName);
                                                 created.Add(firstPairName);
+                                                await FillPairSheetAsync(firstPairName, categoryKeys[0], categoryKeys[1]);
                                             }
                                             else
                                             {
@@ -293,7 +497,10 @@ public class OneDriveExcelService
                             var pairName = categoryKeys[i] + "×" + categoryKeys[j];
                             if (created.Contains(pairName)) continue; // 既にSheet1をリネーム済み
                             if (created.Add(pairName))
+                            {
                                 await CreateSheetIfNotExistsAsync(pairName);
+                                await FillPairSheetAsync(pairName, categoryKeys[i], categoryKeys[j]);
+                            }
                         }
                     }
                 }
