@@ -783,17 +783,21 @@ public class SimpleBot : ActivityHandler
     {
         // === 新方式: 直接 JSON を生成させる ===
         var history = new ChatHistory();
-                        history.AddSystemMessage("""
+        // カテゴリ部分を中央定義から動的生成（変更時にプロンプトとの不整合を避ける）
+        var schemaSampleInner = string.Join(",\n            ", CreativeElementCategories.All
+            .Select(c => $"\"{c}\": [ \"例1\", \"例2\", \"例3\", \"例4\", \"例5\" ]"));
+        var schemaSample = "{" + "\n            " + schemaSampleInner + "\n        }";
+        // どのカテゴリが実行時に読み込まれているか明示ログ
+        Console.WriteLine("[DEBUG][S6] Categories in runtime: " + string.Join(" | ", CreativeElementCategories.All));
+        history.AddSystemMessage($@"""
         あなたは日本語コピーライティング支援アシスタントです。以下の確定情報を踏まえて
         『要素アイデア』を JSON 形式のみで出力してください。余計な説明やコードフェンス、前後テキストは禁止です。
 
         JSON スキーマ（厳守）例:
-        {
-            "状況": [ "例1", "例2", "例3", "例4", "例5" ],
-            "課題・欲求": [ "例1", "例2", "例3", "例4", "例5" ],
-            "感情": [ "例1", "例2", "例3", "例4", "例5" ],
-            "温度感": [ "例1", "例2", "例3", "例4", "例5" ]
-        }
+        {schemaSample}
+
+        必須カテゴリ（欠落・改名・並び替え禁止。全て 5 要素 埋めること。欠けたら不正）:
+        {string.Join(" / ", CreativeElementCategories.All)}
 
         ガイド:
         - 既出情報と矛盾する具体名や数字を作らない
@@ -1307,12 +1311,34 @@ public class SimpleBot : ActivityHandler
     {
         if (string.IsNullOrWhiteSpace(text)) return true;
         var t = text.Trim();
-        if (!t.Contains('？') && !t.Contains('?')) return true; // 必ず質問記号
-        string[] badStarts = { "了解しました", "承知しました", "わかりました", "ありがとうございます", "ではこれらの魅力を中心に" };
-        if (badStarts.Any(bs => t.StartsWith(bs, StringComparison.Ordinal))) return true;
+        // 質問記号必須
+        if (!t.Contains('？') && !t.Contains('?')) return true;
+
+        // 以前は「ありがとうございます」で始まるだけで弾いていたが、実際には
+        // 「ありがとうございます！〜〜を教えてください？」のように有効な質問になるケースが多い。
+        // 了承語のみ + 質問なし を弾きたいので、了承語で開始し、かつ疑問符が末尾近くまで存在しないケースのみ排除するよう緩和。
+        string[] softStarts = { "了解しました", "承知しました", "わかりました", "ありがとうございます", "ではこれらの魅力を中心に" };
+        if (softStarts.Any(ss => t.StartsWith(ss, StringComparison.Ordinal)))
+        {
+            // 了承語部分を除いた残りに 10 文字以上の質問本文 or 疑問符を含むかをチェック
+            var trimmed = softStarts.First(ss => t.StartsWith(ss, StringComparison.Ordinal));
+            var rest = t.Substring(trimmed.Length).Trim();
+            // rest に疑問符が含まれていれば OK（質問として成立）
+            if (!(rest.Contains('？') || rest.Contains('?')))
+            {
+                // 疑問符無し → 無効
+                return true;
+            }
+        }
+
+        // 「〜していきます。」等 完了宣言で締めて質問意図が無いものを排除
         string[] completionLike = { "考えていきます", "進めます", "作っていきます" };
-        if (completionLike.Any(c => t.Contains(c)) && (t.EndsWith("。") || t.EndsWith("！") || t.EndsWith("です。"))) return true;
-        return false;
+        if (completionLike.Any(c => t.Contains(c)) && (t.EndsWith("。") || t.EndsWith("！") || t.EndsWith("です。")) && !(t.Contains('？') || t.Contains('?')))
+        {
+            return true;
+        }
+
+        return false; // 上記条件に当てはまらなければ有効
     }
 
     private static string BuildDynamicCoreFallbackQuestion(string transcript)
@@ -1337,18 +1363,18 @@ public class SimpleBot : ActivityHandler
             if (candidateList.Contains(core)) continue;
             candidateList.Add(core);
         }
-
-        // 十分な候補がなければ汎用一問
-        if (candidateList.Count < 2)
+        // 改善: 2件以上候補があれば列挙形式で聞き直し、1件以下なら段階的フォールバック
+        if (candidateList.Count >= 2)
         {
-            return "提供価値・差別化の核を一言で教えてください。（例：初心者でもすぐ参加できる安心感 など）";
+            var condensed = candidateList.Take(4).ToList();
+            var numbered = condensed.Select((c, i) => $"{i + 1}) {c}");
+            Console.WriteLine($"[DEBUG] Core fallback enumerated ({candidateList.Count} candidates) -> {string.Join(" / ", condensed)}");
+            return "価値の核として最も打ち出したいのはどれでしょうか？ " + string.Join(" ", numbered) + " 5) 他（自由記述）  番号または一言で教えてください。";
         }
 
-        // 先頭4件のみ採用
-        var condensed = candidateList.Take(4).ToList();
-        // 番号付け
-        var numbered = condensed.Select((c,i)=>$"{i+1}) {c}");
-        return "価値の核として最も打ち出したいのはどれでしょうか？ " + string.Join(" ", numbered) + " 5) 他（自由記述）  番号または一言で教えてください。";
+        // 0 or 1 件しか拾えなかった場合は汎用一問（以前の固定文）
+        Console.WriteLine($"[DEBUG] Core fallback generic question (candidates={candidateList.Count})");
+        return "提供価値・差別化の核を一言で教えてください。（例：初心者でもすぐ参加できる安心感 など）";
     }
 
     private static void WriteColored(string text, ConsoleColor color)
@@ -1369,24 +1395,12 @@ public class SimpleBot : ActivityHandler
     private static Dictionary<string, List<string>>? ParseCreativeElementsToSimpleJson(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw)) return null;
-        var dict = new Dictionary<string, List<string>>
-        {
-            ["状況"] = new List<string>(),
-            ["課題・欲求"] = new List<string>(),
-            ["感情"] = new List<string>(),
-            ["温度感"] = new List<string>()
-        };
+        var dict = CreativeElementCategories.All
+            .ToDictionary(k => k, _ => new List<string>());
 
         string? current = null;
         var lines = raw.Replace("\r", string.Empty).Split('\n');
-        var categoryMap = new Dictionary<string, string>
-        {
-            ["状況"] = "状況",
-            ["課題・欲求"] = "課題・欲求",
-            ["感情"] = "感情",
-            ["温度感"] = "温度感",
-            ["トーン＆キャラクターおよび温度感"] = "温度感" // 旧名称互換
-        };
+        var categoryMap = CreativeElementCategories.All.ToDictionary(c => c, c => c); // エイリアス無し（互換不要）
 
         foreach (var rawLine in lines)
         {
@@ -1443,7 +1457,7 @@ public class SimpleBot : ActivityHandler
         {
             var doc = JsonDocument.Parse(raw);
             var root = doc.RootElement;
-            string[] keys = { "状況", "課題・欲求", "感情", "温度感" };
+            string[] keys = CreativeElementCategories.All; // 中央定義
             var dict = new Dictionary<string, List<string>>();
             foreach (var k in keys)
             {
@@ -1470,13 +1484,9 @@ public class SimpleBot : ActivityHandler
         string Format(string label) => dict.TryGetValue(label, out var list) && list.Count > 0
             ? "【" + label + "】\n- " + string.Join("\n- ", list)
             : "";
-        var parts = new List<string?>
-        {
-            Format("状況"),
-            Format("課題・欲求"),
-            Format("感情"),
-            Format("温度感")
-        }.Where(s => !string.IsNullOrWhiteSpace(s));
+        var parts = CreativeElementCategories.All
+            .Select(Format)
+            .Where(s => !string.IsNullOrWhiteSpace(s));
         return string.Join("\n\n", parts);
     }
 
