@@ -30,54 +30,6 @@ public class SimpleBot : ActivityHandler
         var text = turnContext.Activity.Text ?? string.Empty;
         Console.WriteLine($"[USER_INPUT] {text}");
 
-        // まず特定コマンドのハンドリング（他フェーズより優先）
-        if (text.Trim().Equals("/excel", StringComparison.OrdinalIgnoreCase) || text.Trim().Equals("excel", StringComparison.OrdinalIgnoreCase))
-        {
-            if (_oneDriveExcelService == null)
-            {
-                var msg = "OneDrive連携サービスが利用できません（未構成または無効）。";
-                Console.WriteLine($"[USER_MESSAGE] {msg}");
-                await turnContext.SendActivityAsync(MessageFactory.Text(msg, msg), cancellationToken);
-                return;
-            }
-            try
-            {
-                var pre = "OneDriveにExcelを作成しています。";
-                Console.WriteLine($"[USER_MESSAGE] {pre}");
-                await turnContext.SendActivityAsync(MessageFactory.Text(pre, pre), cancellationToken);
-
-                string? uploadedUrl = null;
-                var progress = new Progress<string>(url =>
-                {
-                    uploadedUrl = url;
-                    var upMsg = $"アップロード完了（これから内容を書き込みます）: {url}";
-                    Console.WriteLine($"[USER_MESSAGE] {upMsg}");
-                    turnContext.SendActivityAsync(MessageFactory.Text(upMsg, upMsg), cancellationToken).GetAwaiter().GetResult();
-                });
-
-                var result = await _oneDriveExcelService.CreateAndFillExcelAsync(progress, cancellationToken);
-                if (result.IsSuccess && !string.IsNullOrWhiteSpace(result.WebUrl))
-                {
-                    var done = $"Excel出力完了: {result.WebUrl}";
-                    Console.WriteLine($"[USER_MESSAGE] {done}");
-                    await turnContext.SendActivityAsync(MessageFactory.Text(done, done), cancellationToken);
-                }
-                else
-                {
-                    var err = $"Excel出力失敗: {result.Error ?? "不明なエラー"}";
-                    Console.WriteLine($"[USER_MESSAGE] {err}");
-                    await turnContext.SendActivityAsync(MessageFactory.Text(err, err), cancellationToken);
-                }
-            }
-            catch (Exception exUp)
-            {
-                var err = $"アップロード処理中に例外: {exUp.Message}";
-                Console.WriteLine($"[USER_MESSAGE] {err}");
-                await turnContext.SendActivityAsync(MessageFactory.Text(err, err), cancellationToken);
-            }
-            return; // コマンド処理で終了
-        }
-
         if (string.IsNullOrWhiteSpace(text))
         {
             var emptyMessage = "入力が空です。もう一度入力してください。";
@@ -397,36 +349,18 @@ public class SimpleBot : ActivityHandler
                     Console.WriteLine($"[USER_MESSAGE] {consolidatedAfterStep5}");
                     await turnContext.SendActivityAsync(MessageFactory.Text(consolidatedAfterStep5, consolidatedAfterStep5), cancellationToken);
 
-                    // 直後に Step6（旧Step5）クリエイティブ要素自動生成を実行
-                    if (!state.Step6Completed)
+                    // 直後に Step6 (要約) → Step7 (クリエイティブ要素) を自動実行
+                    if (!state.Step6Completed && _kernel != null)
                     {
-                        var step6 = await GenerateCreativeElementsAsync(
-                            _kernel,
-                            transcript,
-                            state.Step1SummaryJson,
-                            state.FinalPurpose,
-                            state.FinalTarget,
-                            state.FinalUsageContext,
-                            state.FinalCoreValue,
-                            state.ConstraintCharacterLimit,
-                            state.ConstraintCultural,
-                            state.ConstraintLegal,
-                            state.ConstraintOther,
-                            cancellationToken);
-                        if (!string.IsNullOrWhiteSpace(step6))
-                        {
-                            Console.WriteLine($"[USER_MESSAGE] {step6}");
-                            await turnContext.SendActivityAsync(MessageFactory.Text(step6, step6), cancellationToken);
-                            var followMsg = "この要素を使ってキャッチフレーズを作ります。";
-                            Console.WriteLine($"[USER_MESSAGE] {followMsg}");
-                            await turnContext.SendActivityAsync(MessageFactory.Text(followMsg, followMsg), cancellationToken);
-                            state.Step6Completed = true;
-                            // Step7: 自動Excel出力（可能なら）
-                            if (!state.Step7Completed)
-                            {
-                                await TryStep7ExcelAsync(turnContext, state, cancellationToken);
-                            }
-                        }
+                        await TryStep6SummaryAsync(turnContext, state, cancellationToken);
+                    }
+                    if (state.Step6Completed && !state.Step7Completed)
+                    {
+                        await TryStep7CreativeAsync(turnContext, state, cancellationToken);
+                    }
+                    if (state.Step6Completed && state.Step7Completed && !state.Step8Completed)
+                    {
+                        await TryStep8ExcelAsync(turnContext, state, cancellationToken);
                     }
 
                     if (_conversationState != null)
@@ -461,35 +395,13 @@ public class SimpleBot : ActivityHandler
                 return;
             }
 
-            // Step6（クリエイティブ要素自動生成）単独トリガ（万が一 Step5 後に未実行の場合）
-            if (state.Step1Completed && state.Step2Completed && state.Step3Completed && state.Step4Completed && state.Step5Completed && !state.Step6Completed)
+            // Step7（クリエイティブ要素）自動実行フォロー（制約確定後に要約だけ済んでいて、要素未生成の場合）
+            if (state.Step1Completed && state.Step2Completed && state.Step3Completed && state.Step4Completed && state.Step5Completed && state.Step6Completed && !state.Step7Completed)
             {
-                var step6 = await GenerateCreativeElementsAsync(
-                    _kernel,
-                    transcript,
-                    state.Step1SummaryJson,
-                    state.FinalPurpose,
-                    state.FinalTarget,
-                    state.FinalUsageContext,
-                    state.FinalCoreValue,
-                    state.ConstraintCharacterLimit,
-                    state.ConstraintCultural,
-                    state.ConstraintLegal,
-                    state.ConstraintOther,
-                    cancellationToken);
-                if (!string.IsNullOrWhiteSpace(step6))
+                await TryStep7CreativeAsync(turnContext, state, cancellationToken);
+                if (state.Step7Completed && !state.Step8Completed)
                 {
-                    Console.WriteLine($"[USER_MESSAGE] {step6}");
-                    await turnContext.SendActivityAsync(MessageFactory.Text(step6, step6), cancellationToken);
-                    var followMsg = "この要素を使ってキャッチフレーズを作ります。";
-                    Console.WriteLine($"[USER_MESSAGE] {followMsg}");
-                    await turnContext.SendActivityAsync(MessageFactory.Text(followMsg, followMsg), cancellationToken);
-                    state.Step6Completed = true;
-                    // Step7: 自動Excel出力（可能なら）
-                    if (!state.Step7Completed)
-                    {
-                        await TryStep7ExcelAsync(turnContext, state, cancellationToken);
-                    }
+                    await TryStep8ExcelAsync(turnContext, state, cancellationToken);
                 }
                 if (_conversationState != null)
                 {
@@ -788,7 +700,7 @@ public class SimpleBot : ActivityHandler
             .Select(c => $"\"{c}\": [ \"例1\", \"例2\", \"例3\", \"例4\", \"例5\" ]"));
         var schemaSample = "{" + "\n            " + schemaSampleInner + "\n        }";
         // どのカテゴリが実行時に読み込まれているか明示ログ
-        Console.WriteLine("[DEBUG][S6] Categories in runtime: " + string.Join(" | ", CreativeElementCategories.All));
+    Console.WriteLine("[DEBUG][S7] Categories in runtime: " + string.Join(" | ", CreativeElementCategories.All));
         history.AddSystemMessage($@"""
         あなたは日本語コピーライティング支援アシスタントです。以下の確定情報を踏まえて
         『要素アイデア』を JSON 形式のみで出力してください。余計な説明やコードフェンス、前後テキストは禁止です。
@@ -820,7 +732,7 @@ public class SimpleBot : ActivityHandler
         if (!string.IsNullOrWhiteSpace(step1SummaryJson)) ctxLines.Add($"(Step1要約JSONあり)");
 
         history.AddUserMessage($"--- 確定情報 ---\n{string.Join("\n", ctxLines)}\n\n--- 会話履歴 ---\n{transcript}");
-        var response = await InvokeAndLogAsync(kernel, history, ct, "S6/ELEMENTS:GEN");
+    var response = await InvokeAndLogAsync(kernel, history, ct, "S7/ELEMENTS:GEN");
         var raw = response?.Content?.Trim();
         if (string.IsNullOrWhiteSpace(raw)) return raw;
 
@@ -848,17 +760,17 @@ public class SimpleBot : ActivityHandler
                 var fileName = $"creative_elements_{DateTime.UtcNow:yyyyMMdd_HHmmss}.json";
                 var path = Path.Combine(exportDir, fileName);
                 File.WriteAllText(path, json, System.Text.Encoding.UTF8);
-                Console.WriteLine($"[STEP6_JSON_SAVED] {path}");
+                Console.WriteLine($"[STEP7_JSON_SAVED] {path}");
                 // 人間向けにレンダリングして返す
                 return RenderCreativeElementsForUser(dict);
             }
             catch (Exception exWrite)
             {
-                Console.WriteLine($"[STEP6_JSON_WRITE_ERROR] {exWrite.Message}");
+                Console.WriteLine($"[STEP7_JSON_WRITE_ERROR] {exWrite.Message}");
                 return RenderCreativeElementsForUser(dict); // 保存失敗でも表示は行う
             }
         }
-        Console.WriteLine("[STEP6_JSON_TOTAL_FAIL] JSON/旧形式いずれも解析不可 -> 生raw返却");
+    Console.WriteLine("[STEP7_JSON_TOTAL_FAIL] JSON/旧形式いずれも解析不可 -> 生raw返却");
         return raw; // 最悪そのまま
     }
 
@@ -1306,6 +1218,165 @@ public class SimpleBot : ActivityHandler
         return string.Join("\n", lines);
     }
 
+    // Step6: キャッチフレーズ生成向け要約生成（旧Step7）
+    private async Task TryStep6SummaryAsync(ITurnContext turnContext, ElicitationState state, CancellationToken cancellationToken)
+    {
+        // 旧フラグ互換: Step6Completed に反映させる
+        if (state.Step6Completed)
+        {
+            return; // 既に完了
+        }
+        if (_kernel == null)
+        {
+            var msg = "Kernel 未初期化のため要約を実行できません。";
+            Console.WriteLine($"[USER_MESSAGE] {msg}");
+            await turnContext.SendActivityAsync(MessageFactory.Text(msg, msg), cancellationToken);
+            return;
+        }
+        try
+        {
+            var pre = "Step6: 会話を要約しています (キャッチフレーズ用)...";
+            Console.WriteLine($"[S6/SUMMARY][START] {pre}");
+            await turnContext.SendActivityAsync(MessageFactory.Text(pre, pre), cancellationToken);
+
+            var transcript = string.Join("\n", state.History);
+            var consolidated = BuildConsolidatedSummary(state);
+            var prompt = $@"以下はユーザーとの対話ログです。後続でキャッチフレーズ（短く訴求力のある表現）を生成するための要約 JSON を作成してください。
+要件:
+1. 出力は JSON のみ
+2. フィールド: purpose, target, usageContext, coreValue, emotionalTone, constraints, uniqueAngle, keyPhrases (配列 5-10件), brandEssenceCandidates (配列 3件), riskNotes
+3. 不明なフィールドは空文字または空配列
+4. キャッチフレーズ化を意識し、平易で濃縮されたキーワード中心
+--- 対話ログ ---\n{transcript}\n--- 累積整理 ---\n{consolidated}\nJSON:";
+
+            var history = new ChatHistory();
+            history.AddUserMessage(prompt);
+            var resp = await InvokeAndLogAsync(_kernel, history, cancellationToken, "S6/SUMMARY");
+            var content = resp?.Content?.Trim();
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                var warn = "要約生成失敗: 応答が空でした";
+                Console.WriteLine($"[S6/SUMMARY][WARN] {warn}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(warn, warn), cancellationToken);
+                return;
+            }
+            var first = content.IndexOf('{');
+            var last = content.LastIndexOf('}');
+            if (first >= 0 && last > first)
+            {
+                content = content.Substring(first, last - first + 1);
+            }
+            // 1st pass: JSON として妥当か検証し、不備があれば再整形トライ
+            string? normalized = TryNormalizeTaglineSummaryJson(content, out var validationErrors);
+            if (normalized == null)
+            {
+                // 失敗: 元のAI応答をそのまま保存せず、エラー通知
+                var errMsg = "要約JSONの解析に失敗しました: " + string.Join("; ", validationErrors);
+                Console.WriteLine($"[S6/SUMMARY][ERROR] {errMsg}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(errMsg, errMsg), cancellationToken);
+                // 再試行ガイド
+                var guide = "再試行するには 少し待ってから任意のメッセージを送ってください（自動で再試行します）。";
+                await turnContext.SendActivityAsync(MessageFactory.Text(guide, guide), cancellationToken);
+                return;
+            }
+
+            state.TaglineSummaryJson = normalized;
+            state.Step6Completed = true;
+            var done = "Step6完了: 要約JSONを生成しました。";
+            Console.WriteLine($"[S6/SUMMARY][DONE] {done}");
+            await turnContext.SendActivityAsync(MessageFactory.Text(done, done), cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            var err = $"要約生成中に例外: {ex.Message}";
+            Console.WriteLine($"[S6/SUMMARY][EXCEPTION] {err}\n{ex}" );
+            await turnContext.SendActivityAsync(MessageFactory.Text(err, err), cancellationToken);
+        }
+    }
+
+    // Step7 JSON 正規化 & 簡易スキーマ検証
+    private static string? TryNormalizeTaglineSummaryJson(string raw, out List<string> errors)
+    {
+        errors = new List<string>();
+        if (string.IsNullOrWhiteSpace(raw)) { errors.Add("empty"); return null; }
+        // 余計なバッククォート・コードフェンス除去
+        var cleaned = raw.Trim().Trim('`');
+        // 改行先頭にある ```json などを排除
+        cleaned = Regex.Replace(cleaned, "^```(?:json)?", string.Empty, RegexOptions.IgnoreCase | RegexOptions.Multiline);
+        cleaned = cleaned.Replace("```", "");
+
+        JsonDocument? doc = null;
+        try
+        {
+            doc = JsonDocument.Parse(cleaned);
+        }
+        catch (Exception ex)
+        {
+            errors.Add("JSON parse error: " + ex.Message);
+            return null;
+        }
+        var root = doc.RootElement;
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            errors.Add("root is not object");
+            return null;
+        }
+        // 必須フィールド定義
+        var requiredString = new[] { "purpose", "target", "usageContext", "coreValue", "emotionalTone", "constraints", "uniqueAngle", "riskNotes" };
+        var requiredArray = new[] { "keyPhrases", "brandEssenceCandidates" };
+        var outObj = new Dictionary<string, object?>();
+        foreach (var key in requiredString)
+        {
+            if (root.TryGetProperty(key, out var el))
+            {
+                outObj[key] = el.ValueKind == JsonValueKind.String ? el.GetString() : el.ToString();
+            }
+            else
+            {
+                outObj[key] = ""; // 欠損は空文字
+                errors.Add($"missing:{key}");
+            }
+        }
+        foreach (var key in requiredArray)
+        {
+            if (root.TryGetProperty(key, out var el) && el.ValueKind == JsonValueKind.Array)
+            {
+                var list = new List<string>();
+                foreach (var item in el.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.String)
+                        list.Add(item.GetString() ?? "");
+                    else
+                        list.Add(item.ToString());
+                }
+                outObj[key] = list;
+            }
+            else
+            {
+                outObj[key] = new List<string>();
+                errors.Add($"missing_or_not_array:{key}");
+            }
+        }
+        // brandEssenceCandidates は 3件以内にトリム
+        if (outObj["brandEssenceCandidates"] is List<string> bec && bec.Count > 3)
+        {
+            outObj["brandEssenceCandidates"] = bec.Take(3).ToList();
+        }
+        // keyPhrases は 最大10件にトリム
+        if (outObj["keyPhrases"] is List<string> kp && kp.Count > 10)
+        {
+            outObj["keyPhrases"] = kp.Take(10).ToList();
+        }
+        // errors があっても最低限整形したJSONを返し、呼び出し元で null 判定せず保存する戦略もあるが、ここでは欠損が多い場合は失敗にする閾値を設定
+        var criticalMissing = errors.Count(e => e.StartsWith("missing:")) > 5; // 大半欠損は失敗扱い
+        if (criticalMissing)
+        {
+            return null;
+        }
+        var normalized = JsonSerializer.Serialize(outObj, new JsonSerializerOptions { WriteIndented = true });
+        return normalized;
+    }
+
     // Core質問の最低限バリデーション（質問になっているか / 不要な了承だけで終わっていないか）
     private static bool IsInvalidCoreQuestion(string? text)
     {
@@ -1377,6 +1448,42 @@ public class SimpleBot : ActivityHandler
         return "提供価値・差別化の核を一言で教えてください。（例：初心者でもすぐ参加できる安心感 など）";
     }
 
+
+            // 新 Step7: クリエイティブ要素生成（旧 Step6 ロジック呼び出しをラップ）
+            private async Task TryStep7CreativeAsync(ITurnContext turnContext, ElicitationState state, CancellationToken cancellationToken)
+            {
+                if (state.Step7Completed) return;
+                if (_kernel == null)
+                {
+                    var msg = "Kernel 未初期化のためクリエイティブ要素生成を実行できません。";
+                    Console.WriteLine($"[USER_MESSAGE] {msg}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(msg, msg), cancellationToken);
+                    return;
+                }
+                var transcript = string.Join("\n", state.History);
+                var gen = await GenerateCreativeElementsAsync(
+                    _kernel,
+                    transcript,
+                    state.Step1SummaryJson,
+                    state.FinalPurpose,
+                    state.FinalTarget,
+                    state.FinalUsageContext,
+                    state.FinalCoreValue,
+                    state.ConstraintCharacterLimit,
+                    state.ConstraintCultural,
+                    state.ConstraintLegal,
+                    state.ConstraintOther,
+                    cancellationToken);
+                if (!string.IsNullOrWhiteSpace(gen))
+                {
+                    Console.WriteLine($"[USER_MESSAGE] {gen}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(gen, gen), cancellationToken);
+                    var followMsg = "この要素を使ってキャッチフレーズを作ります。";
+                    Console.WriteLine($"[USER_MESSAGE] {followMsg}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(followMsg, followMsg), cancellationToken);
+                    state.Step7Completed = true;
+                }
+            }
     private static void WriteColored(string text, ConsoleColor color)
     {
         var prev = Console.ForegroundColor;
@@ -1535,12 +1642,12 @@ public class SimpleBot : ActivityHandler
         return null;
     }
 
-    // Step7: クリエイティブ要素生成後に自動 Excel 出力（OneDrive）
-    private async Task TryStep7ExcelAsync(ITurnContext turnContext, ElicitationState state, CancellationToken cancellationToken)
+    // Step8: Excel 出力（OneDrive）
+    private async Task TryStep8ExcelAsync(ITurnContext turnContext, ElicitationState state, CancellationToken cancellationToken)
     {
         if (_oneDriveExcelService == null)
         {
-            var skip = "（Excel出力は未構成のためスキップしました。/excel で手動コマンド、または OneDrive 環境変数を設定してください。）";
+            var skip = "（Excel出力は未構成のためスキップしました。OneDrive 環境変数を設定すれば自動生成されます。）";
             Console.WriteLine($"[USER_MESSAGE] {skip}");
             await turnContext.SendActivityAsync(MessageFactory.Text(skip, skip), cancellationToken);
             return;
@@ -1567,7 +1674,7 @@ public class SimpleBot : ActivityHandler
                 var done = $"Excel出力完了: {result.WebUrl}";
                 Console.WriteLine($"[USER_MESSAGE] {done}");
                 await turnContext.SendActivityAsync(MessageFactory.Text(done, done), cancellationToken);
-                state.Step7Completed = true;
+                state.Step8Completed = true;
             }
             else
             {
@@ -1673,8 +1780,11 @@ public class ElicitationState
     public bool Step3Completed { get; set; } = false;
     public bool Step4Completed { get; set; } = false;
     public bool Step5Completed { get; set; } = false; // 制約事項（文字数/文化/法規/その他）
-    public bool Step6Completed { get; set; } = false; // クリエイティブ要素自動生成
-    public bool Step7Completed { get; set; } = false; // Excel出力
+    public bool Step6Completed { get; set; } = false; // 要約生成（キャッチフレーズ用）
+    public bool Step7Completed { get; set; } = false; // クリエイティブ要素自動生成
+    public bool Step8Completed { get; set; } = false; // Excel出力
+    public string? TaglineSummaryJson { get; set; } // Step6生成結果
+    public string? ExcelItemId { get; set; } // Step8 で取得
     // Step2（ターゲット）
     public int Step2QuestionCount { get; set; } = 0;
     public string? FinalTarget { get; set; }
