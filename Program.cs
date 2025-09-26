@@ -177,7 +177,7 @@ app.MapControllers();
 app.MapPost("/onedrive/excel/generate", async ([FromServices] PhraseXross.Services.OneDriveExcelService svc, CancellationToken ct) =>
 {
     // 進捗コールバック不要のため null を指定（新シグネチャ対応）
-    var result = await svc.CreateAndFillExcelAsync(null, ct);
+    var result = await svc.CreateAndFillExcelAsync(null, null, ct);
     return result.IsSuccess ? Results.Ok(new { result.WebUrl, result.FileName }) : Results.BadRequest(new { error = result.Error });
 })
 .WithName("GenerateOneDriveExcel")

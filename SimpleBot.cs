@@ -1282,6 +1282,19 @@ public class SimpleBot : ActivityHandler
 
             state.TaglineSummaryJson = normalized;
             state.Step6Completed = true;
+            try
+            {
+                var exportDir = Path.Combine(AppContext.BaseDirectory, "exports");
+                Directory.CreateDirectory(exportDir);
+                var ts = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+                var path = Path.Combine(exportDir, $"tagline_summary_{ts}.json");
+                await File.WriteAllTextAsync(path, normalized, cancellationToken);
+                Console.WriteLine($"[STEP6_JSON_SAVED] {path}");
+            }
+            catch (Exception exSave)
+            {
+                Console.WriteLine($"[STEP6_JSON_SAVE_ERROR] {exSave.Message}");
+            }
             var done = "Step6完了: 要約JSONを生成しました。";
             Console.WriteLine($"[S6/SUMMARY][DONE] {done}");
             await turnContext.SendActivityAsync(MessageFactory.Text(done, done), cancellationToken);
@@ -1668,7 +1681,7 @@ public class SimpleBot : ActivityHandler
                 turnContext.SendActivityAsync(MessageFactory.Text(upMsg, upMsg), cancellationToken).GetAwaiter().GetResult();
             });
 
-            var result = await _oneDriveExcelService.CreateAndFillExcelAsync(progress, cancellationToken);
+            var result = await _oneDriveExcelService.CreateAndFillExcelAsync(progress, state.TaglineSummaryJson, cancellationToken);
             if (result.IsSuccess && !string.IsNullOrWhiteSpace(result.WebUrl))
             {
                 var done = $"Excel出力完了: {result.WebUrl}";

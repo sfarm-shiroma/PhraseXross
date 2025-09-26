@@ -3,6 +3,7 @@ using Azure.Identity;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Linq;
+// Semantic Kernel は本サービスでは使用せず、Azure OpenAI 環境変数を直接利用して呼び出す方針
 
 namespace PhraseXross.Services;
 
@@ -20,7 +21,7 @@ public class OneDriveExcelService
     }
 
     // uploadedCallback: アップロード完了直後（セル書き込み前）に WebUrl を通知
-    public async Task<OneDriveUploadResult> CreateAndFillExcelAsync(IProgress<string>? uploadedCallback = null, CancellationToken ct = default)
+    public async Task<OneDriveUploadResult> CreateAndFillExcelAsync(IProgress<string>? uploadedCallback = null, string? taglineSummaryJson = null, CancellationToken ct = default)
     {
     // 優先順: Bot 用既存キー (MicrosoftAppId / MicrosoftAppTenantId) → OneDrive 専用キー (新 / 旧) → 構成キー
     var clientId = Environment.GetEnvironmentVariable("MicrosoftAppId")
@@ -106,8 +107,8 @@ public class OneDriveExcelService
                 }
                 try { uploadedCallback?.Report(webUrl); } catch { /* ignore */ }
 
-                // ========= 動的シート生成: Step6 JSON からカテゴリ抽出 → 単体シート + 全てのペアシート =========
-                // 1) 最新 creative_elements_*.json を探す
+                // ========= 動的シート生成: Step7 クリエイティブ要素 JSON からカテゴリ抽出 → 全ペアシート =========
+                // クリエイティブ要素ファイル探索
                 var exportDir = Path.Combine(AppContext.BaseDirectory, "exports");
                 string? latestJson = null;
                 try
@@ -359,33 +360,123 @@ public class OneDriveExcelService
                         _logger.LogWarning(exGW, "Failed to get column width after setting");
                     }
 
-                    // 交差セル (B2..lastColLetter lastRow): firstItem × secondItem
+                    // 交差セル: 生成AIに単発プロンプト送信し結果(5行)を書き込む（履歴非蓄積）
+                    // 既存課題: 完了後に一括 PATCH していたため、途中でプロセス終了すると Excel へ反映されない → 行単位で逐次反映
                     try
                     {
-                        var matrixAddress = $"B2:{lastColLetter}{lastRow}";
-                        var matrixValues = new List<object[]>();
+                        var flushMode = Environment.GetEnvironmentVariable("TAGLINE_FLUSH_MODE")?.Trim().ToUpperInvariant();
+                        if (string.IsNullOrWhiteSpace(flushMode)) flushMode = "ROW"; // ROW | ALL （将来: CELL）
+                        var matrixAddressAll = $"B2:{lastColLetter}{lastRow}";
+                        var matrixValuesAll = new List<object[]>();
+                        // AI エンドポイント設定（任意）。未設定ならプロンプトそのものをセルへ。
+                        // 優先順: TAGLINE_AI_* → AOAI_*
+                        var taglineEndpoint = Environment.GetEnvironmentVariable("TAGLINE_AI_ENDPOINT") ?? _config["TaglineAI:Endpoint"];
+                        var taglineKey = Environment.GetEnvironmentVariable("TAGLINE_AI_KEY") ?? _config["TaglineAI:Key"];
+                        var aoaiEndpoint = Environment.GetEnvironmentVariable("AOAI_ENDPOINT");
+                        var aoaiKey = Environment.GetEnvironmentVariable("AOAI_API_KEY");
+                        var aoaiDeployment = Environment.GetEnvironmentVariable("AOAI_DEPLOYMENT");
+                        var aoaiApiVersion = Environment.GetEnvironmentVariable("AOAI_API_VERSION") ?? "2024-05-01-preview";
+
+                        bool azureOpenAiAvailable = string.IsNullOrWhiteSpace(taglineEndpoint) && !string.IsNullOrWhiteSpace(aoaiEndpoint) && !string.IsNullOrWhiteSpace(aoaiKey) && !string.IsNullOrWhiteSpace(aoaiDeployment);
+                        bool simpleHttpAvailable = !string.IsNullOrWhiteSpace(taglineEndpoint) && !string.IsNullOrWhiteSpace(taglineKey);
                         for (int r = 0; r < vCount; r++)
                         {
                             var row = new object[hCount];
                             for (int c = 0; c < hCount; c++)
                             {
-                                row[c] = firstList[r] + " × " + secondList[c];
+                                var parentVertical = firstCat;
+                                var parentHorizontal = secondCat;
+                                var childVertical = firstList[r];
+                                var childHorizontal = secondList[c];
+                                string prompt = BuildTaglinePrompt(taglineSummaryJson, parentVertical, childVertical, parentHorizontal, childHorizontal);
+                                string cellValue;
+                                if (azureOpenAiAvailable || simpleHttpAvailable)
+                                {
+                                    try
+                                    {
+                                        // セルアドレス計算 (B2 起点)
+                                        string CellAddress()
+                                        {
+                                            var colLetter = ColLetter(2 + c); // B=2
+                                            int rowNum = 2 + r; // 行基準 2
+                                            return colLetter + rowNum.ToString();
+                                        }
+                                        var addr = CellAddress();
+                                        var promptPreview = prompt.Length > 240 ? prompt.Substring(0, 240) + "..." : prompt;
+                                        _logger.LogInformation("[TaglineGen][START] sheet={Sheet} cell={Cell} promptChars={Len} via={Mode} preview=\n{Preview}", safe, addr, prompt.Length, azureOpenAiAvailable?"AzureOpenAI":"SimpleHTTP", promptPreview);
+                                        var started = DateTime.UtcNow;
+                                        if (azureOpenAiAvailable)
+                                        {
+                                            cellValue = await GenerateTaglinesAzureAsync(aoaiEndpoint!, aoaiDeployment!, aoaiKey!, aoaiApiVersion, prompt, ct);
+                                        }
+                                        else // simpleHttpAvailable
+                                        {
+                                            cellValue = await GenerateTaglinesSimpleAsync(taglineEndpoint!, taglineKey!, prompt, ct);
+                                        }
+                                        var elapsed = (DateTime.UtcNow - started).TotalMilliseconds;
+                                        // 行数と先頭行（秘匿情報なし想定）をログ
+                                        var lines = cellValue.Replace("\r", "").Split('\n').Where(l => !string.IsNullOrWhiteSpace(l)).ToList();
+                                        var firstLine = lines.Count > 0 ? lines[0] : "(empty)";
+                                        _logger.LogInformation("[TaglineGen][DONE] sheet={Sheet} cell={Cell} ms={Ms:F0} lines={Count} first='{First}'", safe, addr, elapsed, lines.Count, firstLine);
+                                    }
+                                    catch (Exception exGen)
+                                    {
+                                        _logger.LogWarning(exGen, "Tagline generation failed; fallback to prompt text");
+                                        cellValue = prompt; // フォールバック: プロンプトそのもの
+                                    }
+                                    // レート制御 (簡易) 1秒待機 (SKでも過負荷防止のため統一)
+                                    try { await Task.Delay(1000, ct); } catch { }
+                                }
+                                else
+                                {
+                                    // AI未設定 → プロンプト表示のみ
+                                    cellValue = prompt;
+                                }
+                                row[c] = cellValue;
                             }
-                            matrixValues.Add(row);
+                            if (flushMode == "ROW")
+                            {
+                                // 行単位で即時反映
+                                var rowIndex1Based = 2 + r; // B2 開始
+                                var rowAddress = $"B{rowIndex1Based}:{lastColLetter}{rowIndex1Based}";
+                                var body = new { values = new List<object[]> { row } };
+                                var bodyJson = System.Text.Json.JsonSerializer.Serialize(body);
+                                var rowUrl = $"https://graph.microsoft.com/v1.0/me/drive/items/{itemId}/workbook/worksheets/{Uri.EscapeDataString(safe)}/range(address='{rowAddress}')";
+                                try
+                                {
+                                    using var content = new StringContent(bodyJson, System.Text.Encoding.UTF8, "application/json");
+                                    var res = await SendWithRetry(() => http.PatchAsync(rowUrl, content, ct), ct);
+                                    if (!res.IsSuccessStatusCode)
+                                    {
+                                        _logger.LogWarning("Matrix row write failed {Sheet} row={Row} {Status}", safe, rowIndex1Based, res.StatusCode);
+                                    }
+                                }
+                                catch (Exception exRow)
+                                {
+                                    _logger.LogWarning(exRow, "Matrix row write exception {Sheet} row={Row}", safe, rowIndex1Based);
+                                }
+                            }
+                            else // ALL モード
+                            {
+                                matrixValuesAll.Add(row);
+                            }
                         }
-                        var matrixBody = new { values = matrixValues };
-                        var matrixJson = System.Text.Json.JsonSerializer.Serialize(matrixBody);
-                        var matrixUrl = $"https://graph.microsoft.com/v1.0/me/drive/items/{itemId}/workbook/worksheets/{Uri.EscapeDataString(safe)}/range(address='{matrixAddress}')";
-                        using var content = new StringContent(matrixJson, System.Text.Encoding.UTF8, "application/json");
-                        var res = await SendWithRetry(() => http.PatchAsync(matrixUrl, content, ct), ct);
-                        if (!res.IsSuccessStatusCode)
+                        if (flushMode == "ALL")
                         {
-                            _logger.LogWarning("Matrix write failed {Sheet} {Status}", safe, res.StatusCode);
+                            var matrixBody = new { values = matrixValuesAll };
+                            var matrixJson = System.Text.Json.JsonSerializer.Serialize(matrixBody);
+                            var matrixUrl = $"https://graph.microsoft.com/v1.0/me/drive/items/{itemId}/workbook/worksheets/{Uri.EscapeDataString(safe)}/range(address='{matrixAddressAll}')";
+                            using var content = new StringContent(matrixJson, System.Text.Encoding.UTF8, "application/json");
+                            var res = await SendWithRetry(() => http.PatchAsync(matrixUrl, content, ct), ct);
+                            if (!res.IsSuccessStatusCode)
+                            {
+                                _logger.LogWarning("Matrix prompt write failed {Sheet} {Status}", safe, res.StatusCode);
+                            }
                         }
                     }
                     catch (Exception exM)
                     {
-                        _logger.LogWarning(exM, "Matrix write exception {Sheet}", safe);
+                        _logger.LogWarning(exM, "Matrix prompt write exception {Sheet}", safe);
                     }
                 }
 
@@ -540,6 +631,140 @@ public class OneDriveExcelService
                 continue;
             }
             return res;
+        }
+    }
+
+    // キャッチフレーズ生成用プロンプト組み立て
+    // summaryJson: Step6 要約 JSON（補助情報）
+    // parentVertical / parentHorizontal: カテゴリ名
+    // childVertical / childHorizontal: それぞれの具体的要素
+    // 要望: "[親カテゴリと子要素]" の 2 行（状況 / 課題・欲求 など）をメイン焦点として連想し、
+    // summaryJson は補助的な背景として扱うようプロンプトを再構成。
+    private static string BuildTaglinePrompt(string? summaryJson, string parentVertical, string childVertical, string parentHorizontal, string childHorizontal)
+    {
+        // 余計な改行を圧縮 + Unicodeエスケープ \uXXXX をデコード（AI応答視認性向上目的）
+        string DecodeUnicode(string s)
+        {
+            return System.Text.RegularExpressions.Regex.Replace(s, @"\\u([0-9A-Fa-f]{4})", m =>
+            {
+                var code = Convert.ToInt32(m.Groups[1].Value, 16);
+                return char.ConvertFromUtf32(code);
+            });
+        }
+        string Clean(string? t)
+        {
+            if (string.IsNullOrWhiteSpace(t)) return "";
+            var r = t.Replace("\r", "").Trim();
+            try { r = DecodeUnicode(r); } catch { /* ignore decode errors */ }
+            return r;
+        }
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("あなたは日本語のプロフェッショナルコピーライターです。");
+        sb.AppendLine("最優先で連想・統合すべきメイン情報は直後の '[メインペア]' です。以降の '[参考情報]' は補助的に使い、メインの二つの行から核心を抽出・掛け合わせたインパクトと一貫性を重視してください。");
+        sb.AppendLine();
+        sb.AppendLine("[メインペア]");
+        sb.AppendLine($"{parentVertical}:{childVertical}");
+        sb.AppendLine($"{parentHorizontal}:{childHorizontal}");
+        sb.AppendLine();
+        if (!string.IsNullOrWhiteSpace(summaryJson))
+        {
+            sb.AppendLine("[参考情報 JSON 要約] ※必要な要素のみ暗黙的に活かし、丸写しや列挙をしない");
+            sb.AppendLine(Clean(summaryJson));
+            sb.AppendLine();
+        }
+        sb.AppendLine("[生成指針]");
+        sb.AppendLine("- メインペアのシナジー・緊張関係・ベネフィットを核にする");
+        sb.AppendLine("- 参考情報は語調/差別化/独自性強化のヒントとしてのみ利用");
+        sb.AppendLine("- JSONのフィールド名や記号、括弧、コロンなどは出力に含めない");
+        sb.AppendLine("- 誇大/医療的/裏付けの無い断定を避ける");
+        sb.AppendLine();
+        sb.AppendLine("[出力フォーマット]");
+        sb.AppendLine("キャッチフレーズのみを改行区切りで5行。番号・記号・引用符・前後余白・解説禁止。");
+        sb.AppendLine();
+        sb.AppendLine("[禁止事項]");
+        sb.AppendLine("- 同じ語尾や同じ語の繰り返しで単調になること");
+        sb.AppendLine("- メインペア文の丸写し");
+        sb.AppendLine("- JSONそのもの/キー名の再掲");
+        sb.AppendLine();
+        sb.AppendLine("出力開始→");
+        return sb.ToString();
+    }
+
+    // SK 利用パス: Kernel が存在する場合はこちらで生成
+    // シンプルHTTP (ユーザー独自エンドポイント) 呼び出し
+    private static async Task<string> GenerateTaglinesSimpleAsync(string endpoint, string apiKey, string prompt, CancellationToken ct)
+    {
+        using var http = new HttpClient();
+        http.DefaultRequestHeaders.Add("Authorization", "Bearer " + apiKey);
+        var payload = new { prompt = prompt }; // エンドポイント側で 'prompt' を受け取る想定
+        var json = System.Text.Json.JsonSerializer.Serialize(payload);
+        using var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+        using var res = await http.PostAsync(endpoint, content, ct);
+        if (!res.IsSuccessStatusCode)
+        {
+            var body = await res.Content.ReadAsStringAsync(ct);
+            throw new Exception($"LLM endpoint error {res.StatusCode}: {body}");
+        }
+        var text = await res.Content.ReadAsStringAsync(ct);
+        // 余計な説明行が混在する場合は先頭5行のみにトリム（空行除外）
+        var lines = text.Replace("\r", "").Split('\n')
+            .Select(l => l.Trim())
+            .Where(l => !string.IsNullOrWhiteSpace(l))
+            .Take(5)
+            .ToList();
+        return string.Join("\n", lines);
+    }
+
+    // Azure OpenAI Chat Completions 呼び出し
+    private static async Task<string> GenerateTaglinesAzureAsync(string endpoint, string deployment, string apiKey, string apiVersion, string prompt, CancellationToken ct)
+    {
+        // endpoint 末尾スラッシュ除去
+        endpoint = endpoint.TrimEnd('/');
+        var url = $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={apiVersion}";
+        using var http = new HttpClient();
+        http.DefaultRequestHeaders.Add("api-key", apiKey);
+        http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        var bodyObj = new
+        {
+            messages = new object[]
+            {
+                new { role = "system", content = "あなたは日本語のプロフェッショナルコピーライターです。" },
+                new { role = "user", content = prompt }
+            },
+            temperature = 0.8,
+            top_p = 0.95,
+            max_tokens = 400,
+            n = 1
+        };
+        var json = System.Text.Json.JsonSerializer.Serialize(bodyObj);
+        using var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+        using var res = await http.PostAsync(url, content, ct);
+        var respText = await res.Content.ReadAsStringAsync(ct);
+        if (!res.IsSuccessStatusCode)
+        {
+            throw new Exception($"Azure OpenAI error {res.StatusCode}: {respText}");
+        }
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(respText);
+            var root = doc.RootElement;
+            var contentText = root.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? string.Empty;
+            var lines = contentText.Replace("\r", "").Split('\n')
+                .Select(l => l.Trim())
+                .Where(l => !string.IsNullOrWhiteSpace(l))
+                .Take(5)
+                .ToList();
+            return string.Join("\n", lines);
+        }
+        catch
+        {
+            // パース失敗時は素のテキストをライン整形
+            var lines = respText.Replace("\r", "").Split('\n')
+                .Select(l => l.Trim())
+                .Where(l => !string.IsNullOrWhiteSpace(l))
+                .Take(5)
+                .ToList();
+            return string.Join("\n", lines);
         }
     }
 }
