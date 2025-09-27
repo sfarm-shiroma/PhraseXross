@@ -7,7 +7,14 @@ using System.Linq;
 public static class CreativeElementCategories
 {
     // 利用順序も保持したいので配列（変更時は5要素制約ロジックも見直すこと）
+    //デバッグには多いので、一時的に２つに減らす
     public static readonly string[] All = new[]
+    {
+        "課題・欲求",
+        "場・舞台・空間"
+    };
+
+    /*public static readonly string[] All = new[]
     {
         "状況",
         "課題・欲求",
@@ -15,4 +22,5 @@ public static class CreativeElementCategories
         "温度感",
         "場・舞台・空間"
     };
+    */
 }

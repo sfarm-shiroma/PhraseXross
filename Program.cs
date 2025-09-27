@@ -111,9 +111,9 @@ builder.Services.AddSingleton<CloudAdapter, CloudAdapter>(sp =>
 builder.Services.AddTransient<IBot>(sp =>
 {
     var kernel = sp.GetService<Kernel>();
-    var convo = sp.GetService<ConversationState>();
+    var userState = sp.GetService<UserState>();
     var oneDrive = sp.GetService<PhraseXross.Services.OneDriveExcelService>();
-    return new SimpleBot(kernel, convo, oneDrive);
+    return new SimpleBot(kernel, userState, oneDrive);
 });
 
 // Bot State for multi-turn conversation (yes/no confirmation flow)

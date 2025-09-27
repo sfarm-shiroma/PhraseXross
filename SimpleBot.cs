@@ -15,13 +15,13 @@ using System.Text.RegularExpressions;
 public class SimpleBot : ActivityHandler
 {
     private readonly Kernel? _kernel; // optional
-    private readonly ConversationState? _conversationState;
+    private readonly UserState? _userState; // Phase2: per-user state
     private readonly OneDriveExcelService? _oneDriveExcelService; // optional (OneDrive 連携)
 
-    public SimpleBot(Kernel? kernel = null, ConversationState? conversationState = null, OneDriveExcelService? oneDriveExcelService = null)
+    public SimpleBot(Kernel? kernel = null, UserState? userState = null, OneDriveExcelService? oneDriveExcelService = null)
     {
         _kernel = kernel;
-        _conversationState = conversationState;
+        _userState = userState;
         _oneDriveExcelService = oneDriveExcelService;
     }
 
@@ -40,20 +40,86 @@ public class SimpleBot : ActivityHandler
 
         if (_kernel == null)
         {
-            var kernelErrorMessage = "Kernel が初期化されていません。";
-            Console.WriteLine($"[USER_MESSAGE] {kernelErrorMessage}");
-            await turnContext.SendActivityAsync(MessageFactory.Text(kernelErrorMessage, kernelErrorMessage), cancellationToken);
-            return;
+            // ここに到達するのは設定漏れ。ユーザー通知はせずログのみ（本番では起動時に弾く想定）。
+            Console.WriteLine("[FATAL] Kernel not registered. Configure Semantic Kernel before starting the bot.");
+            return; // 何も返さず黙る（開発時にログで気付く）
         }
 
         try
         {
             // 会話状態取得（ユーザー/アシスタントの履歴を保持）
             var state = new ElicitationState();
-            if (_conversationState != null)
+            if (_userState != null)
             {
-                var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
-                state = await accessor.GetAsync(turnContext, () => new ElicitationState(), cancellationToken);
+                var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                state = await accessor.GetAsync(turnContext, () => ElicitationState.CreateNew(), cancellationToken);
+            }
+
+            // === セッション完了後の自動リセットガード ===
+            // 直前に Step8 が完了しているが、新しいガイダンス前にユーザーが素早く入力した場合、旧 state の履歴を引きずる可能性がある。
+            // Completed セッションにユーザーが通常メッセージを送ったら自動で新規セッションを開始し、その最初のメッセージとして扱う。
+            if (state.Step8Completed && state.CompletedUtc != null && (state.Step1Completed || state.Step2Completed || state.Step3Completed || state.Step4Completed || state.Step5Completed || state.Step6Completed || state.Step7Completed))
+            {
+                var oldSessionId = state.SessionId;
+                state = ElicitationState.CreateNew();
+                if (_userState != null)
+                {
+                    var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                    await accessor.SetAsync(turnContext, state, cancellationToken);
+                    await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
+                }
+                Console.WriteLine($"[AUTO_RESET] Prior session {oldSessionId} was completed. Started new session {state.SessionId} before processing user input.");
+            }
+
+            // /reset コマンド（大小文字・全角半角空白を許容簡易）
+            var trimmed = text.Trim();
+            var lower = trimmed.ToLowerInvariant();
+            if (lower == "/reset" || lower == "reset" || lower == "リセット" || lower == "最初から" || lower == "新規" ||
+                lower == "/new" || lower == "new" || lower == "/start" || lower == "start" || lower == "別件" || lower == "別の")
+            {
+                // 既存セッションを完了扱い (未完了なら Cancelled コメント相当)
+                if (!state.Step8Completed && state.CompletedUtc == null)
+                {
+                    state.CompletedUtc = DateTimeOffset.UtcNow; // 未完了終了
+                }
+                // 新規セッション再生成
+                state = ElicitationState.CreateNew();
+                var msg = "セッションをリセットしました。まずキャッチコピー作成の目的を一言で教えてください。";
+                Console.WriteLine($"[USER_MESSAGE] {msg}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(msg, msg), cancellationToken);
+                if (_userState != null)
+                {
+                    var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                    await accessor.SetAsync(turnContext, state, cancellationToken);
+                    await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
+                }
+                return;
+            }
+
+            // /hardreset は履歴を強制クリア（セッション完了扱い + 新規）
+            if (lower == "/hardreset" || lower == "hardreset")
+            {
+                state.CompletedUtc = DateTimeOffset.UtcNow;
+                state = ElicitationState.CreateNew();
+                state.History.Clear();
+                var msg = "履歴を完全クリアしました。改めて目的を一言で教えてください。";
+                Console.WriteLine($"[USER_MESSAGE] {msg}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(msg, msg), cancellationToken);
+                if (_userState != null)
+                {
+                    var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                    await accessor.SetAsync(turnContext, state, cancellationToken);
+                    await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
+                }
+                return;
+            }
+
+
+            // 新規セッション直後（全ステップ未完）で履歴が残っている場合は防御的にクリア（想定外な残留対策）
+            if (!state.Step1Completed && !state.Step2Completed && !state.Step3Completed && !state.Step4Completed && !state.Step5Completed && !state.Step6Completed && !state.Step7Completed && !state.Step8Completed && state.History.Count > 0)
+            {
+                Console.WriteLine("[DEFENSIVE] Unexpected residual history detected on fresh session. Clearing.");
+                state.History.Clear();
             }
 
             // 履歴にユーザー発話を追加
@@ -79,7 +145,7 @@ public class SimpleBot : ActivityHandler
 
                     var consolidatedAfterStep2 = BuildConsolidatedSummary(state);
                     Console.WriteLine($"[USER_MESSAGE] {consolidatedAfterStep2}");
-                    await turnContext.SendActivityAsync(MessageFactory.Text(consolidatedAfterStep2, consolidatedAfterStep2), cancellationToken);
+                    await SendSummaryAsync(turnContext, consolidatedAfterStep2, cancellationToken);
 
                     // Step3（媒体/利用シーン）へ最初の短い質問を投げる（元の自動遷移ロジックを復元）
                     var mFirst = await GenerateNextMediaQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step3QuestionCount, cancellationToken);
@@ -97,11 +163,11 @@ public class SimpleBot : ActivityHandler
                         await turnContext.SendActivityAsync(MessageFactory.Text(mFirst, mFirst), cancellationToken);
                     }
                     // 状態保存
-                    if (_conversationState != null)
+                    if (_userState != null)
                     {
-                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
                         await accessor.SetAsync(turnContext, state, cancellationToken);
-                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                        await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
                     }
                     return;
                 }
@@ -122,11 +188,11 @@ public class SimpleBot : ActivityHandler
                     state.Step2QuestionCount++;
 
                     // 状態保存
-                    if (_conversationState != null)
+                    if (_userState != null)
                     {
-                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
                         await accessor.SetAsync(turnContext, state, cancellationToken);
-                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                        await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
                     }
 
                     Console.WriteLine($"[USER_MESSAGE] {tAsk}");
@@ -152,7 +218,7 @@ public class SimpleBot : ActivityHandler
 
                     var consolidatedAfterStep3 = BuildConsolidatedSummary(state);
                     Console.WriteLine($"[USER_MESSAGE] {consolidatedAfterStep3}");
-                    await turnContext.SendActivityAsync(MessageFactory.Text(consolidatedAfterStep3, consolidatedAfterStep3), cancellationToken);
+                    await SendSummaryAsync(turnContext, consolidatedAfterStep3, cancellationToken);
 
                     // Step4（コア価値）初回質問を自動生成して即時遷移（Step2->Step3 と対称性を保つ）
                     try
@@ -207,11 +273,11 @@ public class SimpleBot : ActivityHandler
                     }
 
                     // 状態保存
-                    if (_conversationState != null)
+                    if (_userState != null)
                     {
-                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
                         await accessor.SetAsync(turnContext, state, cancellationToken);
-                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                        await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
                     }
                     return;
                 }
@@ -229,11 +295,11 @@ public class SimpleBot : ActivityHandler
                     state.Step3QuestionCount++;
 
                     // 状態保存
-                    if (_conversationState != null)
+                    if (_userState != null)
                     {
-                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
                         await accessor.SetAsync(turnContext, state, cancellationToken);
-                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                        await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
                     }
 
                     Console.WriteLine($"[USER_MESSAGE] {mAsk}");
@@ -258,7 +324,7 @@ public class SimpleBot : ActivityHandler
 
                     var consolidatedAfterStep4 = BuildConsolidatedSummary(state);
                     Console.WriteLine($"[USER_MESSAGE] {consolidatedAfterStep4}");
-                    await turnContext.SendActivityAsync(MessageFactory.Text(consolidatedAfterStep4, consolidatedAfterStep4), cancellationToken);
+                    await SendSummaryAsync(turnContext, consolidatedAfterStep4, cancellationToken);
 
                     // 新Step5（制約事項ヒアリング）へ最初の質問を投げる
                     if (!state.Step5Completed)
@@ -271,11 +337,11 @@ public class SimpleBot : ActivityHandler
                         await turnContext.SendActivityAsync(MessageFactory.Text(firstConstraintQ, firstConstraintQ), cancellationToken);
                     }
 
-                    if (_conversationState != null)
+                    if (_userState != null)
                     {
-                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
                         await accessor.SetAsync(turnContext, state, cancellationToken);
-                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                        await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
                     }
                     return;
                 }
@@ -315,11 +381,11 @@ public class SimpleBot : ActivityHandler
                     TrimHistory(state.History, 30);
                     state.Step4QuestionCount++;
 
-                    if (_conversationState != null)
+                    if (_userState != null)
                     {
-                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
                         await accessor.SetAsync(turnContext, state, cancellationToken);
-                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                        await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
                     }
 
                     Console.WriteLine($"[USER_MESSAGE] {cAsk}");
@@ -347,7 +413,7 @@ public class SimpleBot : ActivityHandler
 
                     var consolidatedAfterStep5 = BuildConsolidatedSummary(state);
                     Console.WriteLine($"[USER_MESSAGE] {consolidatedAfterStep5}");
-                    await turnContext.SendActivityAsync(MessageFactory.Text(consolidatedAfterStep5, consolidatedAfterStep5), cancellationToken);
+                    await SendSummaryAsync(turnContext, consolidatedAfterStep5, cancellationToken);
 
                     // 直後に Step6 (要約) → Step7 (クリエイティブ要素) を自動実行
                     if (!state.Step6Completed && _kernel != null)
@@ -360,14 +426,15 @@ public class SimpleBot : ActivityHandler
                     }
                     if (state.Step6Completed && state.Step7Completed && !state.Step8Completed)
                     {
-                        await TryStep8ExcelAsync(turnContext, state, cancellationToken);
+                        var reset = await TryStep8ExcelAsync(turnContext, state, cancellationToken);
+                        if (reset) return; // 新セッション開始済み
                     }
 
-                    if (_conversationState != null)
+                    if (_userState != null)
                     {
-                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
                         await accessor.SetAsync(turnContext, state, cancellationToken);
-                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                        await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
                     }
                     return;
                 }
@@ -383,11 +450,11 @@ public class SimpleBot : ActivityHandler
                     state.History.Add($"Assistant: {nextConsQ}");
                     TrimHistory(state.History, 30);
                     state.Step5QuestionCount++;
-                    if (_conversationState != null)
+                    if (_userState != null)
                     {
-                        var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                        var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
                         await accessor.SetAsync(turnContext, state, cancellationToken);
-                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                        await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
                     }
                     Console.WriteLine($"[USER_MESSAGE] {nextConsQ}");
                     await turnContext.SendActivityAsync(MessageFactory.Text(nextConsQ, nextConsQ), cancellationToken);
@@ -401,13 +468,14 @@ public class SimpleBot : ActivityHandler
                 await TryStep7CreativeAsync(turnContext, state, cancellationToken);
                 if (state.Step7Completed && !state.Step8Completed)
                 {
-                    await TryStep8ExcelAsync(turnContext, state, cancellationToken);
+                    var reset2 = await TryStep8ExcelAsync(turnContext, state, cancellationToken);
+                    if (reset2) return;
                 }
-                if (_conversationState != null)
+                if (_userState != null)
                 {
-                    var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                    var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
                     await accessor.SetAsync(turnContext, state, cancellationToken);
-                    await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
                 }
                 return;
             }
@@ -437,7 +505,7 @@ public class SimpleBot : ActivityHandler
 
                 var summaryMsg = BuildConsolidatedSummary(state);
                 Console.WriteLine($"[USER_MESSAGE] {summaryMsg}");
-                await turnContext.SendActivityAsync(MessageFactory.Text(summaryMsg, summaryMsg), cancellationToken);
+                await SendSummaryAsync(turnContext, summaryMsg, cancellationToken);
 
                 // Step1完了フラグ
                 state.Step1Completed = true;
@@ -459,11 +527,11 @@ public class SimpleBot : ActivityHandler
                 }
 
                 // 状態保存
-                if (_conversationState != null)
+                if (_userState != null)
                 {
-                    var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                    var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
                     await accessor.SetAsync(turnContext, state, cancellationToken);
-                    await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
                 }
                 return;
             }
@@ -485,11 +553,11 @@ public class SimpleBot : ActivityHandler
                 state.Step1QuestionCount++;
 
                 // 状態保存
-                if (_conversationState != null)
+                if (_userState != null)
                 {
-                    var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                    var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
                     await accessor.SetAsync(turnContext, state, cancellationToken);
-                    await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
                 }
 
                 Console.WriteLine($"[USER_MESSAGE] {ask}");
@@ -518,10 +586,10 @@ public class SimpleBot : ActivityHandler
         {
             var welcomeMessage = "こんにちは。今日はどんな言葉づくりをお手伝いしましょう？まずは、差し支えなければ『何の活動のためのコピーか』を教えてください。（例：イベント告知／販促キャンペーン／ブランド認知／採用 など）";
 
-            if (_conversationState != null)
+            if (_userState != null)
             {
-                var accessor = _conversationState.CreateProperty<ElicitationState>(nameof(ElicitationState));
-                var state = await accessor.GetAsync(turnContext, () => new ElicitationState(), cancellationToken);
+                var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                var state = await accessor.GetAsync(turnContext, () => ElicitationState.CreateNew(), cancellationToken);
                 if (!state.WelcomeSent)
                 {
                     Console.WriteLine($"[USER_MESSAGE] {welcomeMessage}");
@@ -529,7 +597,7 @@ public class SimpleBot : ActivityHandler
 
                     state.WelcomeSent = true;
                     await accessor.SetAsync(turnContext, state, cancellationToken);
-                    await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
                 }
             }
             else
@@ -944,7 +1012,16 @@ public class SimpleBot : ActivityHandler
         lines.Add($"文化・配慮: {(!string.IsNullOrWhiteSpace(state.ConstraintCultural) ? state.ConstraintCultural : "指定なし")}");
         lines.Add($"法規・レギュレーション: {(!string.IsNullOrWhiteSpace(state.ConstraintLegal) ? state.ConstraintLegal : "指定なし")}");
         lines.Add($"その他: {(!string.IsNullOrWhiteSpace(state.ConstraintOther) ? state.ConstraintOther : "指定なし")}");
-        return string.Join("\n", lines);
+        // クライアントによっては \n だけだと単一行扱いされる可能性があるため CRLF で連結
+        var summary = string.Join("\r\n", lines);
+        // デバッグ: 実際の可視化用に制御文字をエスケープした形をログ出力
+        try
+        {
+            var visible = summary.Replace("\r", "<CR>").Replace("\n", "<LF>");
+            Console.WriteLine($"[SUMMARY_DEBUG] raw='{visible}' len={summary.Length}");
+        }
+        catch { /* ignore logging errors */ }
+        return summary;
     }
 
     // Step4: 次のコア確認質問を生成（既出の手がかりを活かす）
@@ -1148,7 +1225,7 @@ public class SimpleBot : ActivityHandler
                 if (!string.IsNullOrWhiteSpace(expressionHints)) lines.Add($"- 表現案の手がかり\n- {expressionHints}");
             }
             return string.Join("\n", lines);
-        }
+               }
         catch
         {
             return $"目的: {fallbackPurpose}";
@@ -1176,7 +1253,7 @@ public class SimpleBot : ActivityHandler
 
     // 累積サマリー生成（各ステップの確定情報を統合）
     private static string BuildConsolidatedSummary(ElicitationState state)
-    {
+   {
         string purpose = state.FinalPurpose ?? "";
         string usage = state.FinalUsageContext ?? "";
         string target = state.FinalTarget ?? "";
@@ -1202,20 +1279,34 @@ public class SimpleBot : ActivityHandler
         }
 
         var lines = new List<string>();
-        lines.Add("— ここまでの整理 —");
-        if (!string.IsNullOrWhiteSpace(purpose)) lines.Add($"目的: {purpose}");
-        if (state.Step2Completed && !string.IsNullOrWhiteSpace(target)) lines.Add($"ターゲット: {target}");
-        if (state.Step3Completed && !string.IsNullOrWhiteSpace(usage)) lines.Add($"媒体/利用シーン: {usage}");
-        if (state.Step4Completed && !string.IsNullOrWhiteSpace(core)) lines.Add($"コア価値: {core}");
+    // Markdown クライアントで確実に段落分離されるよう、ヘッダー行の末尾に半角スペース2つ + 空行を挿入
+    lines.Add("— ここまでの整理 —  ");
+    lines.Add(string.Empty);
+        // ラベルを【】で囲む形式に変更
+        if (!string.IsNullOrWhiteSpace(purpose)) lines.Add($"【目的】: {purpose}");
+        if (state.Step2Completed && !string.IsNullOrWhiteSpace(target)) lines.Add($"【ターゲット】: {target}");
+        if (state.Step3Completed && !string.IsNullOrWhiteSpace(usage)) lines.Add($"【媒体/利用シーン】: {usage}");
+        if (state.Step4Completed && !string.IsNullOrWhiteSpace(core)) lines.Add($"【コア価値】: {core}");
         if (state.Step5Completed)
         {
-            lines.Add("制約事項:");
+            lines.Add("【制約事項】:");
             lines.Add($"- 文字数: {(string.IsNullOrWhiteSpace(charLimit) ? "指定なし" : charLimit)}");
             lines.Add($"- 文化・配慮: {(string.IsNullOrWhiteSpace(cultural) ? "指定なし" : cultural)}");
             lines.Add($"- 法規・レギュレーション: {(string.IsNullOrWhiteSpace(legal) ? "指定なし" : legal)}");
             lines.Add($"- その他: {(string.IsNullOrWhiteSpace(other) ? "指定なし" : other)}");
         }
         return string.Join("\n", lines);
+    }
+
+    // サマリーをMarkdownとして送信（チャネル側で改行が潰れないよう TextFormat=markdown を指定）
+    private static async Task SendSummaryAsync(ITurnContext turnContext, string summary, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(summary)) return;
+        // 改行は CRLF に統一し markdown として送信
+        var normalized = summary.Replace("\r\n", "\n").Replace("\n", "\r\n");
+        var activity = MessageFactory.Text(normalized, normalized);
+        activity.TextFormat = "markdown"; // 対応チャネルで複数行レンダリング
+        await turnContext.SendActivityAsync(activity, cancellationToken);
     }
 
     // Step6: キャッチフレーズ生成向け要約生成（旧Step7）
@@ -1358,9 +1449,10 @@ public class SimpleBot : ActivityHandler
                 foreach (var item in el.EnumerateArray())
                 {
                     if (item.ValueKind == JsonValueKind.String)
-                        list.Add(item.GetString() ?? "");
-                    else
-                        list.Add(item.ToString());
+                    {
+                        var v = item.GetString();
+                        if (!string.IsNullOrWhiteSpace(v)) list.Add(v!.Trim());
+                    }
                 }
                 outObj[key] = list;
             }
@@ -1400,7 +1492,7 @@ public class SimpleBot : ActivityHandler
 
         // 以前は「ありがとうございます」で始まるだけで弾いていたが、実際には
         // 「ありがとうございます！〜〜を教えてください？」のように有効な質問になるケースが多い。
-        // 了承語のみ + 質問なし を弾きたいので、了承語で開始し、かつ疑問符が末尾近くまで存在しないケースのみ排除するよう緩和。
+        // 了承語のみ + 質問なし を弾きたいので、了承語で開始し、かつ疑問符が末尾近くまで存在しないケースのみ排除。
         string[] softStarts = { "了解しました", "承知しました", "わかりました", "ありがとうございます", "ではこれらの魅力を中心に" };
         if (softStarts.Any(ss => t.StartsWith(ss, StringComparison.Ordinal)))
         {
@@ -1656,29 +1748,27 @@ public class SimpleBot : ActivityHandler
     }
 
     // Step8: Excel 出力（OneDrive）
-    private async Task TryStep8ExcelAsync(ITurnContext turnContext, ElicitationState state, CancellationToken cancellationToken)
+    // 戻り値: true の場合、セッションがリセットされ新しい state に切り替わった（呼び出し側は以降旧 state を使わない）
+    private async Task<bool> TryStep8ExcelAsync(ITurnContext turnContext, ElicitationState state, CancellationToken cancellationToken)
     {
         if (_oneDriveExcelService == null)
         {
             var skip = "（Excel出力は未構成のためスキップしました。OneDrive 環境変数を設定すれば自動生成されます。）";
             Console.WriteLine($"[USER_MESSAGE] {skip}");
             await turnContext.SendActivityAsync(MessageFactory.Text(skip, skip), cancellationToken);
-            return;
+            return false;
         }
         try
         {
-            var pre = "OneDriveにExcelを作成しています。";
-            Console.WriteLine($"[USER_MESSAGE] {pre}");
-            await turnContext.SendActivityAsync(MessageFactory.Text(pre, pre), cancellationToken);
-
             string? uploadedUrl = null;
             var progress = new Progress<string>(url =>
             {
                 uploadedUrl = url;
-                var upMsg = $"アップロード完了（これから内容を書き込みます）: {url}";
-                Console.WriteLine($"[USER_MESSAGE] {upMsg}");
-                // Fire & forget (TurnContext はスレッドセーフでないので同期呼び出し) → Task.Runせず直接待機
-                turnContext.SendActivityAsync(MessageFactory.Text(upMsg, upMsg), cancellationToken).GetAwaiter().GetResult();
+                // ユーザー選択メッセージ（候補2）: クロスマトリクス法でこれから順次キャッチフレーズを埋めていく案内
+                var matrixMsg = $"このファイル上でクロスマトリクス法を使い、順次キャッチフレーズを埋めていきます。進捗はこちらから確認できます：{url}";
+                Console.WriteLine($"[USER_MESSAGE] {matrixMsg}");
+                // 進捗案内を送信（同期待機）
+                turnContext.SendActivityAsync(MessageFactory.Text(matrixMsg, matrixMsg), cancellationToken).GetAwaiter().GetResult();
             });
 
             var result = await _oneDriveExcelService.CreateAndFillExcelAsync(progress, state.TaglineSummaryJson, cancellationToken);
@@ -1688,12 +1778,30 @@ public class SimpleBot : ActivityHandler
                 Console.WriteLine($"[USER_MESSAGE] {done}");
                 await turnContext.SendActivityAsync(MessageFactory.Text(done, done), cancellationToken);
                 state.Step8Completed = true;
+                state.CompletedUtc = DateTimeOffset.UtcNow;
+                // 旧セッションの履歴を明示クリア（新セッションへ引き継がない保証を強調）
+                state.History.Clear();
+
+                // 完了後ガイダンス（自動で新規セッションを始めるか案内のみ）→ここでは案内+自動新規開始
+                var guidance = "このセッションは完了しました。新しい案件を開始します。キャッチコピー作成の目的を一言で教えてください。"; // 将来: カスタマイズ可能
+                // 新しいセッションへ差し替え
+                var newState = ElicitationState.CreateNew();
+                if (_userState != null)
+                {
+                    var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                    await accessor.SetAsync(turnContext, newState, cancellationToken);
+                    await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
+                }
+                Console.WriteLine($"[USER_MESSAGE] {guidance}");
+                await turnContext.SendActivityAsync(MessageFactory.Text(guidance, guidance), cancellationToken);
+                return true; // セッションリセット通知
             }
             else
             {
                 var err = $"Excel出力失敗: {result.Error ?? "不明なエラー"}";
                 Console.WriteLine($"[USER_MESSAGE] {err}");
                 await turnContext.SendActivityAsync(MessageFactory.Text(err, err), cancellationToken);
+                return false;
             }
         }
         catch (Exception ex)
@@ -1701,80 +1809,10 @@ public class SimpleBot : ActivityHandler
             var err = $"Excel出力中に例外: {ex.Message}";
             Console.WriteLine($"[USER_MESSAGE] {err}");
             await turnContext.SendActivityAsync(MessageFactory.Text(err, err), cancellationToken);
+            return false;
         }
     }
-}
 
-public class CatchphraseSkill
-{
-    [KernelFunction]
-    public string DefinePurpose(string input)
-    {
-        if (string.IsNullOrWhiteSpace(input))
-        {
-            return "入力が空です。キャッチコピーの目的を入力してください。";
-        }
-
-        // 目的を生成するテンプレート
-        return $"キャッチコピーの目的を明確にしました: 「{input}」を基に、ターゲットに響く魅力的なキャッチコピーを作成します。例: 『{input}で世界を変える』";
-    }
-
-    [KernelFunction]
-    public string SetTarget(string input)
-    {
-        return $"ターゲットを設定しました: {input}";
-    }
-
-    [KernelFunction]
-    public string ClarifyEssence(string input)
-    {
-        return $"商品・サービスの本質を整理しました: {input}";
-    }
-
-    // 内部評価用のヘルパー（SKへ直接プロンプト送信）
-    public async Task<string> EvaluatePurposeAsync(string input, Kernel kernel)
-    {
-        if (string.IsNullOrWhiteSpace(input))
-        {
-            return "入力が空です。キャッチコピーの目的を入力してください。";
-        }
-
-        // 直接プロンプトで評価（グローバル関数登録なし・重複回避）
-        var prompt = @"あなたはマーケティングのプロです。以下のユーザー入力が
-            キャッチコピー作成の『目的』として十分に明確かを評価してください。
-            次のJSONで返答してください（余計なテキストは出力しない）：
-            {
-                ""isSatisfied"": true,
-                ""reason"": ""短い説明""
-            }
-
-            ユーザー入力: {{$input}}";
-
-        var arguments = new KernelArguments
-        {
-            { "input", input }
-        };
-
-        var jsonResponse = await kernel.InvokePromptAsync(prompt, arguments);
-
-        // Null チェック
-        var jsonString = jsonResponse?.GetValue<string>();
-        if (string.IsNullOrEmpty(jsonString))
-        {
-            return "AIからの応答が無効です。もう一度お試しください。";
-        }
-
-        // AIの判断結果を解析
-        var result = JsonSerializer.Deserialize<JsonElement>(jsonString);
-        if (result.GetProperty("isSatisfied").GetBoolean())
-        {
-            return "目的が明確になりました。次のステップに進みます。";
-        }
-        else
-        {
-            return "目的がまだ明確ではありません。もう少し具体的に入力してください。";
-        }
-    }
 }
 
 // 目的引き出し用の会話状態
@@ -1782,6 +1820,9 @@ public class ElicitationState
 {
     public List<string> History { get; } = new List<string>();
     public string? FinalPurpose { get; set; }
+    public string SessionId { get; set; } = Guid.NewGuid().ToString();
+    public DateTimeOffset StartedUtc { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? CompletedUtc { get; set; }
     public string? Step1SummaryJson { get; set; }
     // Step1の質問回数（くどさを抑えるためのペース制御）
     public int Step1QuestionCount { get; set; } = 0;
@@ -1814,6 +1855,24 @@ public class ElicitationState
     public string? ConstraintLegal { get; set; }
     public string? ConstraintOther { get; set; }
     // Step6（クリエイティブ要素）: 質問カウント不要
+
+    public static ElicitationState CreateNew()
+    {
+        return new ElicitationState
+        {
+            SessionId = Guid.NewGuid().ToString(),
+            StartedUtc = DateTimeOffset.UtcNow,
+            CompletedUtc = null,
+            Step1Completed = false,
+            Step2Completed = false,
+            Step3Completed = false,
+            Step4Completed = false,
+            Step5Completed = false,
+            Step6Completed = false,
+            Step7Completed = false,
+            Step8Completed = false
+        };
+    }
 }
 
 // 評価者の判定結果
