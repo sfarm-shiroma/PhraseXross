@@ -12,6 +12,8 @@ using System.Collections.Generic;
 using System;
 using System.Text.RegularExpressions;
 using Microsoft.Bot.Builder.Dialogs; // for DialogState
+using System.IdentityModel.Tokens.Jwt; // JWT デコード用
+using Microsoft.Bot.Builder.Integration.AspNet.Core; // CloudAdapter
 
 public class SimpleBot : ActivityHandler
 {
@@ -508,8 +510,44 @@ public class SimpleBot : ActivityHandler
                 lines.Add($"LastTokenAcquiredUtc: {state.LastTokenAcquiredUtc:O}");
                 lines.Add($"DelegatedTokenPresent: {!string.IsNullOrWhiteSpace(state.DelegatedGraphToken)}");
                 lines.Add($"WaitingForSignIn: {state.WaitingForSignIn}");
+                if (state.DelegatedTokenExpiresUtc != null)
+                {
+                    var remain = state.DelegatedTokenExpiresUtc.Value - DateTimeOffset.UtcNow;
+                    if (remain < TimeSpan.Zero) remain = TimeSpan.Zero;
+                    lines.Add($"TokenExpiresUtc: {state.DelegatedTokenExpiresUtc:O}");
+                    lines.Add($"TokenRemaining: {remain:hh\\:mm\\:ss}");
+                }
                 var txt = string.Join("\n", lines);
                 await turnContext.SendActivityAsync(MessageFactory.Text(txt, txt), cancellationToken);
+                return;
+            }
+
+            if (lower == "/expiretoken")
+            {
+                state.DelegatedTokenExpiresUtc = DateTimeOffset.UtcNow.AddSeconds(-10);
+                var msg = "ローカルでトークン期限を強制的に失効状態にしました。次回 Step8 実行で再取得動作を確認できます。";
+                await turnContext.SendActivityAsync(MessageFactory.Text(msg, msg), cancellationToken);
+                if (_userState != null)
+                {
+                    var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                    await accessor.SetAsync(turnContext, state, cancellationToken);
+                    await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
+                }
+                return;
+            }
+
+            if (lower == "/droptoken")
+            {
+                state.DelegatedGraphToken = null;
+                state.DelegatedTokenExpiresUtc = null;
+                var msg = "保存していたトークンを破棄しました。次の Step8 でサインインカードが表示されます。";
+                await turnContext.SendActivityAsync(MessageFactory.Text(msg, msg), cancellationToken);
+                if (_userState != null)
+                {
+                    var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                    await accessor.SetAsync(turnContext, state, cancellationToken);
+                    await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
+                }
                 return;
             }
 
@@ -2331,33 +2369,11 @@ public class SimpleBot : ActivityHandler
                 // 進捗案内を送信（同期待機）
                 turnContext.SendActivityAsync(MessageFactory.Text(matrixMsg, matrixMsg), cancellationToken).GetAwaiter().GetResult();
             });
-
-            // OAuthPrompt により state に保存されたトークンを利用
-            string? delegatedToken = state.DelegatedGraphToken;
-
-            // トークン未取得ならサインインカードを提示して終了
+            // 常に直前で有効トークンを確保（期限切れならサイレント更新）
+            var delegatedToken = await EnsureGraphTokenAsync(turnContext, state, cancellationToken);
             if (string.IsNullOrWhiteSpace(delegatedToken))
             {
-                // トークンがない → Dialog (OAuthPrompt) が次ターンでサインインカードを提示するのでガイドのみ
-                if (!state.WaitingForSignIn) state.WaitingForSignIn = true;
-                var guide = "OneDrive へのアクセス許可がまだ付与されていません。サインインカードを表示しますので認証を完了してください。";
-                await turnContext.SendActivityAsync(MessageFactory.Text(guide, guide), cancellationToken);
-                // 同一ターン内で即時 OAuthPrompt を起動（従来は次ターンまで待っていた）
-                if (_conversationState != null && _mainDialog != null)
-                {
-                    try
-                    {
-                        var dialogStateAccessor = _conversationState.CreateProperty<DialogState>("DialogState");
-                        Console.WriteLine("[OAUTH][Inline] MainDialog invoked from Step8 (no token)");
-                        await _mainDialog.RunAsync(turnContext, dialogStateAccessor, cancellationToken);
-                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
-                    }
-                    catch (Exception exInline)
-                    {
-                        Console.WriteLine("[OAUTH][Inline][ERROR] " + exInline.Message);
-                        await turnContext.SendActivityAsync(MessageFactory.Text("サインインカードの起動に失敗しました: " + exInline.Message), cancellationToken);
-                    }
-                }
+                // サインインカードを表示済み（次ターンで再開）
                 return false;
             }
 
@@ -2401,6 +2417,113 @@ public class SimpleBot : ActivityHandler
             await turnContext.SendActivityAsync(MessageFactory.Text(err, err), cancellationToken);
             return false;
         }
+    }
+
+    // Aパターン: 毎回利用直前にフレームワークからトークンを取得（サイレント更新）し、無ければ OAuthPrompt を開始
+    private async Task<string?> EnsureGraphTokenAsync(ITurnContext turnContext, ElicitationState state, CancellationToken ct)
+    {
+        var connectionName = Environment.GetEnvironmentVariable("BOT_OAUTH_CONNECTION_NAME") ?? "GraphDelegated";
+        // 期限が5分未満なら必ず再取得試行（state に保存された古い値は盲信しない）
+        bool nearingExpiry = state.DelegatedTokenExpiresUtc != null && (state.DelegatedTokenExpiresUtc.Value - DateTimeOffset.UtcNow) < TimeSpan.FromMinutes(5);
+
+        if (!nearingExpiry && !string.IsNullOrWhiteSpace(state.DelegatedGraphToken))
+        {
+            return state.DelegatedGraphToken; // 有効期限に余裕があるのでそのまま利用
+        }
+
+        try
+        {
+            // CloudAdapter 環境では TurnState から UserTokenClient を取得するのが推奨
+            object? userTokenClientObj = null;
+            foreach (var kv in turnContext.TurnState)
+            {
+                var t = kv.Value?.GetType()?.FullName;
+                if (t == "Microsoft.Bot.Builder.Integration.AspNet.Core.UserTokenClient" || t == "Microsoft.Bot.Connector.Authentication.UserTokenClientImpl")
+                {
+                    userTokenClientObj = kv.Value; break;
+                }
+            }
+            if (userTokenClientObj != null)
+            {
+                var method = userTokenClientObj.GetType().GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
+                    .FirstOrDefault(m => m.Name == "GetUserTokenAsync" && m.GetParameters().Length >= 4);
+                if (method != null)
+                {
+                    // 代表的シグネチャ (userId, connectionName, channelId, magicCode, cancellationToken)
+                    var ps = method.GetParameters();
+                    object?[] args;
+                    if (ps.Length == 5)
+                        args = new object?[] { turnContext.Activity.From?.Id, connectionName, turnContext.Activity.ChannelId, null, ct };
+                    else if (ps.Length == 4)
+                        args = new object?[] { turnContext.Activity.From?.Id, connectionName, turnContext.Activity.ChannelId, ct };
+                    else
+                        args = Array.Empty<object?>();
+                    if (args.Length > 0)
+                    {
+                        var taskObj = method.Invoke(userTokenClientObj, args);
+                        if (taskObj is Task task)
+                        {
+                            await task.ConfigureAwait(false);
+                            var resultProp = task.GetType().GetProperty("Result");
+                            var tokenResponse = resultProp?.GetValue(task);
+                            var tokenProp = tokenResponse?.GetType().GetProperty("Token");
+                            var tokenVal = tokenProp?.GetValue(tokenResponse) as string;
+                            if (!string.IsNullOrWhiteSpace(tokenVal))
+                            {
+                                state.DelegatedGraphToken = tokenVal;
+                                state.LastTokenAcquiredUtc = DateTimeOffset.UtcNow;
+                                state.WaitingForSignIn = false;
+                                state.DelegatedTokenExpiresUtc = TryReadJwtExpiry(tokenVal);
+                                if (_userState != null)
+                                {
+                                    var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                                    await accessor.SetAsync(turnContext, state, ct);
+                                    await _userState.SaveChangesAsync(turnContext, false, ct);
+                                }
+                                return tokenVal;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[OAUTH][Ensure] silent acquisition failed: {ex.Message}");
+        }
+
+        // ここまでで取得できなかった → OAuthPrompt 起動
+        if (_conversationState != null && _mainDialog != null)
+        {
+            state.WaitingForSignIn = true;
+            var guide = "OneDrive へのアクセス許可が必要です。サインインカードを表示しますので認証してください。";
+            await turnContext.SendActivityAsync(MessageFactory.Text(guide, guide), ct);
+            try
+            {
+                var dialogStateAccessor = _conversationState.CreateProperty<DialogState>("DialogState");
+                Console.WriteLine("[OAUTH][Ensure] MainDialog invoked (token missing)");
+                await _mainDialog.RunAsync(turnContext, dialogStateAccessor, ct);
+                await _conversationState.SaveChangesAsync(turnContext, false, ct);
+            }
+            catch (Exception exStart)
+            {
+                Console.WriteLine("[OAUTH][Ensure][ERROR] " + exStart.Message);
+                await turnContext.SendActivityAsync(MessageFactory.Text("サインインカードの起動に失敗しました: " + exStart.Message), ct);
+            }
+        }
+        return null;
+    }
+
+    private static DateTimeOffset? TryReadJwtExpiry(string token)
+    {
+        try
+        {
+            var handler = new JwtSecurityTokenHandler();
+            if (!handler.CanReadToken(token)) return null;
+            var jwt = handler.ReadJwtToken(token);
+            return jwt.ValidTo == DateTime.MinValue ? null : new DateTimeOffset(jwt.ValidTo, TimeSpan.Zero);
+        }
+        catch { return null; }
     }
 
 }
@@ -2457,6 +2580,7 @@ public class ElicitationState
     public int OAuthPromptStartCount { get; set; } = 0;
     public DateTimeOffset? OAuthPromptLastAttemptUtc { get; set; }
     public DateTimeOffset? LastTokenAcquiredUtc { get; set; }
+    public DateTimeOffset? DelegatedTokenExpiresUtc { get; set; } // JWT exp (診断用)
 
     public static ElicitationState CreateNew()
     {
