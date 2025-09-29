@@ -251,7 +251,7 @@ public class OneDriveExcelService
                         _logger.LogWarning(exH, "Horizontal write exception {Sheet}", safe);
                     }
 
-                    // 軸セルの塗りつぶし: 縦軸(#FBE2D5), 横軸(#DAE9F8)
+                    // 軸セルの塗りつぶし + 太字化: 縦軸(#FBE2D5), 横軸(#DAE9F8)
                     async Task ApplyFillAsync(string address, string color)
                     {
                         var fillUrl = $"https://graph.microsoft.com/v1.0/me/drive/items/{itemId}/workbook/worksheets/{Uri.EscapeDataString(safe)}/range(address='{address}')/format/fill";
@@ -271,11 +271,34 @@ public class OneDriveExcelService
                         }
                     }
 
+                    // 軸セルフォント太字化
+                    async Task ApplyBoldAsync(string address)
+                    {
+                        var fontUrl = $"https://graph.microsoft.com/v1.0/me/drive/items/{itemId}/workbook/worksheets/{Uri.EscapeDataString(safe)}/range(address='{address}')/format/font";
+                        var body = "{\"bold\":true}"; // { "bold": true }
+                        try
+                        {
+                            using var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+                            var res = await SendWithRetry(() => http.PatchAsync(fontUrl, content, ct), ct);
+                            if (!res.IsSuccessStatusCode)
+                            {
+                                _logger.LogWarning("Set bold failed {Sheet} {Addr} {Status}", safe, address, res.StatusCode);
+                            }
+                        }
+                        catch (Exception exB)
+                        {
+                            _logger.LogWarning(exB, "Set bold exception {Sheet} {Addr}", safe, address);
+                        }
+                    }
+
                     // A列 (A2..A{lastRow}) と 横ヘッダー (B1..{lastColLetter}1)
                     await ApplyFillAsync($"A2:A{lastRow}", "#FBE2D5");
                     await ApplyFillAsync(horizAddress, "#DAE9F8");
+                    // 太字化（縦軸+横軸）
+                    await ApplyBoldAsync($"A2:A{lastRow}");
+                    await ApplyBoldAsync(horizAddress);
 
-                    // 列幅調整: A ~ lastColLetter を幅 45 に統一
+                    // 列幅調整: A ~ lastColLetter を幅 300pt に統一（可視性優先。必要なら環境変数化予定）
                     async Task SetColumnWidthAsync(string fromCol, string toCol, double width)
                     {
                         var absRange = fromCol == toCol ? $"${fromCol}:${toCol}" : $"${fromCol}:${toCol}"; // 列全体 ($A:$D)
@@ -308,7 +331,7 @@ public class OneDriveExcelService
                             _logger.LogWarning(exW, "Set column width exception {Sheet} {From}-{To}", safe, fromCol, toCol);
                         }
                     }
-                    await SetColumnWidthAsync("A", lastColLetter, 200); // 視覚確認用に大きめ幅(200pt)を設定
+                    await SetColumnWidthAsync("A", lastColLetter, 300); // 300pt に拡大
 
                     // 設定結果の一部を取得しログ（A列）
                     try

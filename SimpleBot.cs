@@ -411,6 +411,41 @@ public class SimpleBot : ActivityHandler
                 state = await accessor.GetAsync(turnContext, () => ElicitationState.CreateNew(), cancellationToken);
             }
 
+            // --- 手法A: 会話開始フォールバック初期ガイダンス ---
+            // Teams 等で conversationUpdate (membersAdded) が届かず Welcome が未送信のまま
+            // ユーザーが最初の発話をしてきた場合に、ここで静的な Step1 導入メッセージを一度だけ挿入する。
+            // 条件:
+            //   - まだどの Step も完了していない
+            //   - WelcomeSent == false
+            //   - 過去履歴/質問カウントが 0（= まだボットからのヒアリング未開始）
+            //   - 入力がコマンド (/ で始まる) ではない
+            //   - Reset 系での再開直後を除く (History.Count == 0 を条件とする)
+            var isAnyStepCompleted = state.Step1Completed || state.Step2Completed || state.Step3Completed || state.Step4Completed || state.Step5Completed || state.Step6Completed || state.Step7Completed || state.Step8Completed;
+            var disableFallbackWelcome = string.Equals(Environment.GetEnvironmentVariable("PX_DISABLE_FALLBACK_WELCOME"), "true", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(Environment.GetEnvironmentVariable("PX_DISABLE_FALLBACK_WELCOME"), "1", StringComparison.OrdinalIgnoreCase);
+            if (!disableFallbackWelcome && !isAnyStepCompleted && !state.WelcomeSent && state.History.Count == 0 && state.Step1QuestionCount == 0 && !string.IsNullOrWhiteSpace(text) && !text.TrimStart().StartsWith("/"))
+            {
+                var fallbackWelcome = "こんにちは。今日はどんな言葉づくりをお手伝いしましょう？まずは、差し支えなければ『何の活動のためのコピーか』を教えてください。（例：イベント告知／販促キャンペーン／ブランド認知／採用 など）";
+                // ユーザー最初の発話が既に同内容（コピペ等）の場合は抑止
+                var normalizedUser = text.Replace("\\s+", " ").Trim();
+                var normalizedWelcome = fallbackWelcome.Replace("\\s+", " ").Trim();
+                if (!normalizedUser.Equals(normalizedWelcome, StringComparison.Ordinal))
+                {
+                    Console.WriteLine($"[USER_MESSAGE][FallbackWelcome] {fallbackWelcome}");
+                    await turnContext.SendActivityAsync(MessageFactory.Text(fallbackWelcome, fallbackWelcome), cancellationToken);
+                    state.History.Add($"Assistant: {fallbackWelcome}"); // 重複抑制のため履歴へも記録
+                    TrimHistory(state.History, 30);
+                }
+                state.WelcomeSent = true; // 二重送信防止
+                if (_userState != null)
+                {
+                    var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+                    await accessor.SetAsync(turnContext, state, cancellationToken);
+                    await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
+                }
+                // 続けてユーザー発話を Step1 の回答として既存ロジックに流す（return しない）
+            }
+
             // 先に /forceauth を処理（auto-run と競合させない）
             var rawLower = text.Trim().ToLowerInvariant();
             if (rawLower == "/forceauth")
@@ -1191,9 +1226,17 @@ public class SimpleBot : ActivityHandler
                 var state = await accessor.GetAsync(turnContext, () => ElicitationState.CreateNew(), cancellationToken);
                 if (!state.WelcomeSent)
                 {
-                    Console.WriteLine($"[USER_MESSAGE] {welcomeMessage}");
-                    await turnContext.SendActivityAsync(MessageFactory.Text(welcomeMessage, welcomeMessage), cancellationToken);
-
+                    // 直前にフォールバックで既に送っているケースを保険的に検知（履歴末尾と比較）
+                    var lastAssistant = state.History.LastOrDefault(h => h.StartsWith("Assistant:"));
+                    var normalizedExisting = lastAssistant?.Replace("\\s+", " ") ?? string.Empty;
+                    var normalizedWelcome = ("Assistant: " + welcomeMessage).Replace("\\s+", " ");
+                    if (!string.Equals(normalizedExisting, normalizedWelcome, StringComparison.Ordinal))
+                    {
+                        Console.WriteLine($"[USER_MESSAGE] {welcomeMessage}");
+                        await turnContext.SendActivityAsync(MessageFactory.Text(welcomeMessage, welcomeMessage), cancellationToken);
+                        state.History.Add($"Assistant: {welcomeMessage}");
+                        TrimHistory(state.History, 30);
+                    }
                     state.WelcomeSent = true;
                     await accessor.SetAsync(turnContext, state, cancellationToken);
                     await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
@@ -1685,6 +1728,8 @@ public class SimpleBot : ActivityHandler
 
                 不足があれば isSatisfied=false とし reason に不足点（例: イベント種類不明 / 対象製品不明 など）を列挙。
 
+                最初の一回目の会話であれば、ユーザーは、どうすればいいかわかっていない可能性があるので、何をする場面かを説明するようにしてください。
+
                 出力は次のJSONのみ。コードフェンスや余計な前置きは禁止:
                 {
                     ""isSatisfied"": true,
@@ -1988,6 +2033,10 @@ public class SimpleBot : ActivityHandler
             var done = "Step6完了: 要約JSONを生成しました。";
             Console.WriteLine($"[S6/SUMMARY][DONE] {done}");
             await turnContext.SendActivityAsync(MessageFactory.Text(done, done), cancellationToken);
+            // Step7 開始案内
+            var step7Intro = "ヒアリングした内容から、キャッチフレーズを生成するための要素を生成します。";
+            Console.WriteLine($"[S7/INTRO] {step7Intro}");
+            await turnContext.SendActivityAsync(MessageFactory.Text(step7Intro, step7Intro), cancellationToken);
         }
         catch (Exception ex)
         {
@@ -2364,7 +2413,10 @@ public class SimpleBot : ActivityHandler
             {
                 uploadedUrl = url;
                 // ユーザー選択メッセージ（候補2）: クロスマトリクス法でこれから順次キャッチフレーズを埋めていく案内
-                var matrixMsg = $"このファイル上でクロスマトリクス法を使い、順次キャッチフレーズを埋めていきます。進捗はこちらから確認できます：{url}";
+                // NOTE: Teams 等クライアントで URL の自動リンク化が全角コロン（：, U+FF1A）直後だと行われない場合があるため
+                // 半角コロン + 改行を使って URL のオートリンクを確実にする。
+                // 例: "...確認できます:\nhttps://..."
+                var matrixMsg = $"このファイル上でクロスマトリクス法を使い、順次キャッチフレーズを埋めていきます。進捗はこちらから確認できます:\n{url}";
                 Console.WriteLine($"[USER_MESSAGE] {matrixMsg}");
                 // 進捗案内を送信（同期待機）
                 turnContext.SendActivityAsync(MessageFactory.Text(matrixMsg, matrixMsg), cancellationToken).GetAwaiter().GetResult();
