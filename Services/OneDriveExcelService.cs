@@ -21,46 +21,24 @@ public class OneDriveExcelService
     }
 
     // uploadedCallback: アップロード完了直後（セル書き込み前）に WebUrl を通知
-    public async Task<OneDriveUploadResult> CreateAndFillExcelAsync(IProgress<string>? uploadedCallback = null, string? taglineSummaryJson = null, CancellationToken ct = default)
+    // delegatedAccessToken: Teams SSO / OAuth 経由で既に取得済みのユーザー委譲トークン（preferred）。null の場合は開発用フォールバックとして DeviceCode Flow を試行。
+    public async Task<OneDriveUploadResult> CreateAndFillExcelAsync(
+        IProgress<string>? uploadedCallback = null,
+        string? taglineSummaryJson = null,
+        CancellationToken ct = default,
+        string? delegatedAccessToken = null)
     {
-    // 優先順: Bot 用既存キー (MicrosoftAppId / MicrosoftAppTenantId) → OneDrive 専用キー (新 / 旧) → 構成キー
-    var clientId = Environment.GetEnvironmentVariable("MicrosoftAppId")
-               ?? _config["MicrosoftAppId"]
-               ?? Environment.GetEnvironmentVariable("OneDriveClientId")
-               ?? Environment.GetEnvironmentVariable("ONEDRIVE_CLIENT_ID")
-               ?? _config["OneDriveClientId"]
-               ?? _config["OneDrive:ClientId"]
-               ?? string.Empty;
-    var tenantId = Environment.GetEnvironmentVariable("MicrosoftAppTenantId")
-               ?? _config["MicrosoftAppTenantId"]
-               ?? Environment.GetEnvironmentVariable("OneDriveTenantId")
-               ?? Environment.GetEnvironmentVariable("ONEDRIVE_TENANT_ID")
-               ?? _config["OneDriveTenantId"]
-               ?? _config["OneDrive:TenantId"]
-               ?? string.Empty;
-        if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(tenantId))
+        if (string.IsNullOrWhiteSpace(delegatedAccessToken))
         {
-            // 例外ではなく失敗結果を返却して上位でユーザーフレンドリーな文言を出す
-            return OneDriveUploadResult.Fail("OneDriveの資格情報が未設定です。MicrosoftAppId / MicrosoftAppTenantId もしくは OneDriveClientId / OneDriveTenantId（旧: ONEDRIVE_CLIENT_ID / ONEDRIVE_TENANT_ID）のいずれかを設定してください。");
+            // フォールバック（DeviceCode）は本番要件と乖離するため廃止。呼び出し側で SignInCard を提示する運用。
+            return OneDriveUploadResult.Fail("ユーザーの委譲トークンが未取得のため Excel 出力を実行できません。まずサインインしてください。");
         }
-        var scopes = new[] { "Files.ReadWrite" };
 
-        var credential = new DeviceCodeCredential(new DeviceCodeCredentialOptions
-        {
-            ClientId = clientId,
-            TenantId = tenantId,
-            DeviceCodeCallback = (code, cancellationToken) =>
-            {
-                _logger.LogInformation("Device code: {Message}", code.Message);
-                return Task.CompletedTask;
-            }
-        });
-
-        var token = await credential.GetTokenAsync(new TokenRequestContext(scopes), ct);
-        _logger.LogInformation("Graph token acquired (expires {ExpiresOn})", token.ExpiresOn);
+        var accessToken = delegatedAccessToken!;
+        _logger.LogDebug("Using delegated Graph access token (length={Len}).", accessToken.Length);
 
         var http = _httpClientFactory.CreateClient("graph");
-        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
+        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
 
         // copy template
         var template = Path.Combine(AppContext.BaseDirectory, "Templates", "EmptyExcel.xlsx");

@@ -24,4 +24,28 @@
     <Content Include="Templates\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <!-- Publish 除外: 機密や不要 (環境依存) ファイルを発行成果物から外す -->
+  <ItemGroup>
+    <!-- ルート .env はローカル専用。publish しない -->
+    <None Update=".env" CopyToPublishDirectory="Never" />
+    <!-- ローカルサンプル設定類（必要でなければ追加） -->
+    <None Update="appsettings.json.sample" CopyToPublishDirectory="Never" />
+    <None Update="appsettings.json.example" CopyToPublishDirectory="Never" />
+    <!-- Dockerfile/README/開発用 Markdown は不要 -->
+    <None Update="Dockerfile" CopyToPublishDirectory="Never" />
+    <None Update="DEBUGGING-DOCKER.md" CopyToPublishDirectory="Never" />
+    <!-- ローカル exports (生成物) を万一含めない -->
+    <None Update="exports\**\*" CopyToPublishDirectory="Never" />
+  </ItemGroup>
+
+  <!-- 安全策: patterns で拾われる可能性を先に Remove -->
+  <ItemGroup>
+    <Content Remove=".env" />
+    <Content Remove="Dockerfile" />
+    <Content Remove="DEBUGGING-DOCKER.md" />
+    <Content Remove="appsettings.json.sample" />
+    <Content Remove="appsettings.json.example" />
+    <Content Remove="exports\**\*" />
+  </ItemGroup>
+
 </Project>

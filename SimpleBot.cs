@@ -11,18 +11,372 @@ using System.Text.Json;
 using System.Collections.Generic;
 using System;
 using System.Text.RegularExpressions;
+using Microsoft.Bot.Builder.Dialogs; // for DialogState
 
 public class SimpleBot : ActivityHandler
 {
     private readonly Kernel? _kernel; // optional
     private readonly UserState? _userState; // Phase2: per-user state
     private readonly OneDriveExcelService? _oneDriveExcelService; // optional (OneDrive 連携)
+        private readonly PhraseXross.Dialogs.MainDialog _mainDialog; // OAuthPrompt を含む Dialog
+        private readonly ConversationState? _conversationState;
 
-    public SimpleBot(Kernel? kernel = null, UserState? userState = null, OneDriveExcelService? oneDriveExcelService = null)
+        public SimpleBot(Kernel? kernel = null, UserState? userState = null, OneDriveExcelService? oneDriveExcelService = null, PhraseXross.Dialogs.MainDialog? mainDialog = null, ConversationState? conversationState = null)
+        {
+            _kernel = kernel;
+            _userState = userState;
+            _oneDriveExcelService = oneDriveExcelService;
+            _mainDialog = mainDialog ?? throw new ArgumentNullException(nameof(mainDialog));
+            _conversationState = conversationState; // null 許容 (DI 差し込み漏れ対策)
+        }
+
+    private async Task<string?> TryGetDelegatedTokenAsync(ITurnContext turnContext, CancellationToken cancellationToken)
     {
-        _kernel = kernel;
-        _userState = userState;
-        _oneDriveExcelService = oneDriveExcelService;
+        string? delegatedToken = null;
+        var connectionName = Environment.GetEnvironmentVariable("BOT_OAUTH_CONNECTION_NAME") ?? "GraphDelegated";
+        Console.WriteLine($"[DEBUG][SSO] TryGetDelegatedTokenAsync start userId='{turnContext.Activity.From?.Id}' channel='{turnContext.Activity.ChannelId}' conn='{connectionName}'");
+        // 追加: メソッド探索や TurnState のキー一覧を詳細ログ（診断用）
+        try
+        {
+            var turnStateTypes = turnContext.TurnState.Select(kv => kv.Value?.GetType()?.FullName ?? kv.Key ?? "<null>");
+            Console.WriteLine("[DEBUG][SSO] TurnState types=" + string.Join(" | ", turnStateTypes));
+        }
+        catch { }
+        ElicitationState? state = null;
+        try
+        {
+            if (_userState != null)
+            {
+                var accessor = _userState.CreateProperty<ElicitationState>("ElicitationState");
+                state = await accessor.GetAsync(turnContext, () => ElicitationState.CreateNew(), cancellationToken);
+                state.LastTokenAttemptUtc = DateTimeOffset.UtcNow;
+                state.LastTokenResult = null; // reset
+                state.LastDelegatedTokenPreview = null;
+            }
+        }
+        catch { /* state 取得失敗は致命ではない */ }
+        try
+        {
+            object? userTokenClientObj = null;
+            foreach (var kv in turnContext.TurnState)
+            {
+                var type = kv.Value?.GetType();
+                if (type == null) continue;
+                if (type.FullName == "Microsoft.Bot.Builder.Integration.AspNet.Core.UserTokenClient" || type.FullName == "Microsoft.Bot.Connector.Authentication.UserTokenClientImpl")
+                {
+                    userTokenClientObj = kv.Value; break;
+                }
+            }
+            if (userTokenClientObj != null)
+            {
+                Console.WriteLine("[DEBUG][SSO] UserTokenClient found (reflection)");
+                // パラメータ差異を考慮し複数候補を試す
+                var methods = userTokenClientObj.GetType().GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
+                    .Where(m => m.Name == "GetUserTokenAsync")
+                    .ToList();
+                Console.WriteLine("[DEBUG][SSO] GetUserTokenAsync candidates paramSets=" + string.Join(" || ", methods.Select(m => string.Join(",", m.GetParameters().Select(p => p.ParameterType.Name)))));
+                foreach (var mi in methods)
+                {
+                    try
+                    {
+                        var ps = mi.GetParameters();
+                        object?[] args;
+                        switch (ps.Length)
+                        {
+                            case 5: // (userId, connectionName, channelId, magicCode, cancellationToken)
+                                args = new object?[] { turnContext.Activity.From?.Id, connectionName, turnContext.Activity.ChannelId, null, cancellationToken }; break;
+                            case 4: // (userId, connectionName, channelId, cancellationToken)
+                                args = new object?[] { turnContext.Activity.From?.Id, connectionName, turnContext.Activity.ChannelId, cancellationToken }; break;
+                            case 3: // (turnContext, connectionName, cancellationToken) など想定外 → スキップ
+                                continue;
+                            default:
+                                continue;
+                        }
+                        var taskObj = mi.Invoke(userTokenClientObj, args);
+                        if (taskObj is Task t)
+                        {
+                            await t.ConfigureAwait(false);
+                            var resultProp = t.GetType().GetProperty("Result");
+                            var tokenResponse = resultProp?.GetValue(t);
+                            var tokenProp = tokenResponse?.GetType().GetProperty("Token");
+                            delegatedToken = tokenProp?.GetValue(tokenResponse) as string;
+                            if (!string.IsNullOrEmpty(delegatedToken))
+                            {
+                                Console.WriteLine($"[DEBUG][SSO] Token retrieved via signature paramCount={ps.Length}");
+                                break;
+                            }
+                        }
+                    }
+                    catch (Exception exEach)
+                    {
+                        Console.WriteLine($"[DEBUG][SSO] GetUserTokenAsync variant failed: {exEach.GetType().Name}:{exEach.Message}");
+                    }
+                }
+            }
+            else
+            {
+                var adapter = turnContext.Adapter as BotAdapter;
+                if (adapter != null)
+                {
+                    Console.WriteLine($"[DEBUG][SSO] Adapter reflection path adapterType='{adapter.GetType().FullName}'");
+                    var mi = adapter.GetType().GetMethod("GetUserTokenAsync", new[] { typeof(ITurnContext), typeof(string), typeof(string), typeof(CancellationToken) });
+                    if (mi != null)
+                    {
+                        var taskObj = mi.Invoke(adapter, new object?[] { turnContext, connectionName, null, cancellationToken });
+                        if (taskObj is Task t2)
+                        {
+                            await t2.ConfigureAwait(false);
+                            var resultProp = t2.GetType().GetProperty("Result");
+                            var tokenResponse = resultProp?.GetValue(t2);
+                            var tokenProp = tokenResponse?.GetType().GetProperty("Token");
+                            delegatedToken = tokenProp?.GetValue(tokenResponse) as string;
+                        }
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("[DEBUG][SSO] Adapter is null or not BotAdapter");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[DEBUG][SSO] TryGetDelegatedTokenAsync failed: {ex.Message}");
+            if (state != null) state.LastTokenResult = "exception:" + ex.GetType().Name;
+        }
+        if (!string.IsNullOrWhiteSpace(delegatedToken))
+        {
+            Console.WriteLine($"[DEBUG][SSO] Delegated token acquired (auto check). Length={delegatedToken.Length} Preview={MaskToken(delegatedToken)}");
+            if (state != null && _userState != null)
+            {
+                state.LastTokenResult = "success";
+                state.LastDelegatedTokenPreview = MaskToken(delegatedToken);
+                try { await _userState.SaveChangesAsync(turnContext, false, cancellationToken); } catch { }
+            }
+        }
+        else
+        {
+            if (state != null && _userState != null)
+            {
+                if (state.LastTokenResult == null) state.LastTokenResult = "null";
+                try { await _userState.SaveChangesAsync(turnContext, false, cancellationToken); } catch { }
+            }
+        }
+        return delegatedToken;
+    }
+
+    private async Task<string?> TryGetSignInUrlAsync(ITurnContext turnContext, CancellationToken cancellationToken)
+    {
+        var connectionName = Environment.GetEnvironmentVariable("BOT_OAUTH_CONNECTION_NAME") ?? "GraphDelegated";
+        try
+        {
+            object? userTokenClientObj = null;
+            foreach (var kv in turnContext.TurnState)
+            {
+                var type = kv.Value?.GetType();
+                if (type == null) continue;
+                if (type.FullName == "Microsoft.Bot.Builder.Integration.AspNet.Core.UserTokenClient" || type.FullName == "Microsoft.Bot.Connector.Authentication.UserTokenClientImpl")
+                {
+                    userTokenClientObj = kv.Value; break;
+                }
+            }
+            if (userTokenClientObj == null)
+            {
+                Console.WriteLine("[DEBUG][SSO] UserTokenClient not found for sign-in URL");
+                return null;
+            }
+            // SDK バージョン差異によりパラメータが異なるため、すべての候補メソッドを試行
+            var candidates = userTokenClientObj.GetType()
+                .GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
+                .Where(m => m.Name == "GetSignInResourceAsync")
+                .ToList();
+            if (candidates.Count == 0)
+            {
+                Console.WriteLine("[DEBUG][SSO] GetSignInResourceAsync not found via reflection");
+                return null;
+            }
+            Console.WriteLine("[DEBUG][SSO] GetSignInResourceAsync candidates: " + string.Join(" | ", candidates.Select(c => string.Join(",", c.GetParameters().Select(p => p.ParameterType.Name)))));
+
+            foreach (var mi in candidates)
+            {
+                try
+                {
+                    var ps = mi.GetParameters();
+                    object?[] args;
+                    // 代表的パターンを順次マッピング
+                    switch (ps.Length)
+                    {
+                        case 5:
+                            // (string connectionName, string userId, string channelId, string? finalRedirect, CancellationToken)
+                            args = new object?[] { connectionName, turnContext.Activity.From?.Id, turnContext.Activity.ChannelId, null, cancellationToken };
+                            break;
+                        case 4:
+                            // (string connectionName, string userId, string channelId, CancellationToken) もしくは finalRedirect 省略
+                            args = new object?[] { connectionName, turnContext.Activity.From?.Id, turnContext.Activity.ChannelId, cancellationToken };
+                            break;
+                        case 3:
+                            // (string connectionName, string userId, CancellationToken)
+                            args = new object?[] { connectionName, turnContext.Activity.From?.Id, cancellationToken };
+                            break;
+                        default:
+                            Console.WriteLine($"[DEBUG][SSO] Skip unsupported signature paramCount={ps.Length}");
+                            continue;
+                    }
+                    var taskObj = mi.Invoke(userTokenClientObj, args);
+                    if (taskObj is Task t)
+                    {
+                        await t.ConfigureAwait(false);
+                        var resultProp = t.GetType().GetProperty("Result");
+                        var signInResource = resultProp?.GetValue(t);
+                        if (signInResource != null)
+                        {
+                            var linkProp = signInResource.GetType().GetProperty("SignInLink") ?? signInResource.GetType().GetProperty("Link");
+                            var link = linkProp?.GetValue(signInResource) as string;
+                            if (!string.IsNullOrWhiteSpace(link))
+                            {
+                                Console.WriteLine($"[DEBUG][SSO] SignInLink obtained via signature paramCount={ps.Length} length={link.Length}");
+                                return link;
+                            }
+                        }
+                    }
+                }
+                catch (Exception exEach)
+                {
+                    Console.WriteLine($"[DEBUG][SSO] GetSignInResourceAsync candidate failed: {exEach.GetType().Name}:{exEach.Message}");
+                    // 次の候補を試す
+                }
+            }
+            Console.WriteLine("[DEBUG][SSO] All GetSignInResourceAsync attempts failed.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[DEBUG][SSO] TryGetSignInUrlAsync failed: {ex.Message}");
+        }
+        return null;
+    }
+
+    private static string MaskToken(string token)
+    {
+        if (string.IsNullOrEmpty(token)) return "";
+        if (token.Length <= 8) return new string('*', token.Length);
+        return token.Substring(0, 4) + "..." + token.Substring(token.Length - 4);
+    }
+
+    private static string TrimForDump(string text, int max)
+    {
+        if (string.IsNullOrEmpty(text)) return "";
+        if (text.Length <= max) return text;
+        return text.Substring(0, max) + "...";
+    }
+
+    private static string MaskMid(string value)
+    {
+        if (string.IsNullOrEmpty(value) || value == "<null>") return value ?? "";
+        if (value.Length <= 6) return new string('*', value.Length);
+        return value.Substring(0,3) + "***" + value.Substring(value.Length-3);
+    }
+
+    protected override async Task OnEventActivityAsync(ITurnContext<IEventActivity> turnContext, CancellationToken cancellationToken)
+    {
+        Console.WriteLine($"[DEBUG][SSO][Event] name='{turnContext.Activity.Name}' channel='{turnContext.Activity.ChannelId}' type='{turnContext.Activity.Type}'");
+        // tokens/response など OAuthPrompt が処理すべきイベントを Dialog に流す
+        if (_conversationState != null && _mainDialog != null &&
+            (string.Equals(turnContext.Activity.Name, "tokens/response", StringComparison.OrdinalIgnoreCase)))
+        {
+            var dialogStateAccessor = _conversationState.CreateProperty<DialogState>("DialogState");
+            Console.WriteLine("[OAUTH][EventPipeline] Forwarding tokens/response to Dialog");
+            await _mainDialog.RunAsync(turnContext, dialogStateAccessor, cancellationToken);
+            await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+        }
+
+        // トークン取得後の Excel 再開など
+        if (_userState != null && _oneDriveExcelService != null)
+        {
+            var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+            var state = await accessor.GetAsync(turnContext, () => ElicitationState.CreateNew(), cancellationToken);
+            if (state.WaitingForSignIn && !state.Step8Completed)
+            {
+                // OAuthPrompt により state.DelegatedGraphToken が埋まっていれば再開
+                if (!string.IsNullOrWhiteSpace(state.DelegatedGraphToken))
+                {
+                    var token = state.DelegatedGraphToken;
+                    state.WaitingForSignIn = false;                    
+                    await turnContext.SendActivityAsync(MessageFactory.Text("サインインが完了しました。Excel 出力を再開します。"), cancellationToken);
+                    var result = await _oneDriveExcelService.CreateAndFillExcelAsync(null, state.TaglineSummaryJson, cancellationToken, token);
+                    if (result.IsSuccess && !string.IsNullOrWhiteSpace(result.WebUrl))
+                    {
+                        var done = $"Excel出力完了: {result.WebUrl}";
+                        await turnContext.SendActivityAsync(MessageFactory.Text(done, done), cancellationToken);
+                        state.Step8Completed = true;
+                        state.CompletedUtc = DateTimeOffset.UtcNow;
+                        state.History.Clear();
+                        var guidance = "このセッションは完了しました。新しい案件を開始します。キャッチコピー作成の目的を一言で教えてください。";
+                        var newState = ElicitationState.CreateNew();
+                        await accessor.SetAsync(turnContext, newState, cancellationToken);
+                        await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
+                        await turnContext.SendActivityAsync(MessageFactory.Text(guidance, guidance), cancellationToken);
+                        return;
+                    }
+                    else
+                    {
+                        var err = $"Excel出力失敗: {result.Error ?? "不明なエラー"}";
+                        await turnContext.SendActivityAsync(MessageFactory.Text(err, err), cancellationToken);
+                    }
+                }
+            }
+            await accessor.SetAsync(turnContext, state, cancellationToken);
+            await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
+        }
+        await base.OnEventActivityAsync(turnContext, cancellationToken);
+    }
+
+    protected override async Task<InvokeResponse> OnInvokeActivityAsync(ITurnContext<IInvokeActivity> turnContext, CancellationToken cancellationToken)
+    {
+        // signin/tokenExchange 等にも対応
+        Console.WriteLine($"[DEBUG][SSO][Invoke] name='{turnContext.Activity.Name}' channel='{turnContext.Activity.ChannelId}' type='{turnContext.Activity.Type}'");
+        var isSignInInvoke = string.Equals(turnContext.Activity.Name, "signin/tokenExchange", StringComparison.OrdinalIgnoreCase) || string.Equals(turnContext.Activity.Name, "signin/verifyState", StringComparison.OrdinalIgnoreCase);
+        if (isSignInInvoke && _conversationState != null && _mainDialog != null)
+        {
+            var dialogStateAccessor = _conversationState.CreateProperty<DialogState>("DialogState");
+            Console.WriteLine("[OAUTH][InvokePipeline] Forwarding invoke to Dialog (OAuthPrompt)");
+            await _mainDialog.RunAsync(turnContext, dialogStateAccessor, cancellationToken);
+            await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+        }
+
+        if (isSignInInvoke && _userState != null && _oneDriveExcelService != null)
+        {
+            var accessor = _userState.CreateProperty<ElicitationState>(nameof(ElicitationState));
+            var state = await accessor.GetAsync(turnContext, () => ElicitationState.CreateNew(), cancellationToken);
+            if (state.WaitingForSignIn && !state.Step8Completed && !string.IsNullOrWhiteSpace(state.DelegatedGraphToken))
+            {
+                var token = state.DelegatedGraphToken;
+                state.WaitingForSignIn = false;
+                var result = await _oneDriveExcelService.CreateAndFillExcelAsync(null, state.TaglineSummaryJson, cancellationToken, token);
+                if (result.IsSuccess && !string.IsNullOrWhiteSpace(result.WebUrl))
+                {
+                    var done = $"Excel出力完了: {result.WebUrl}";
+                    await turnContext.SendActivityAsync(MessageFactory.Text(done, done), cancellationToken);
+                    state.Step8Completed = true;
+                    state.CompletedUtc = DateTimeOffset.UtcNow;
+                    state.History.Clear();
+                    var guidance = "このセッションは完了しました。新しい案件を開始します。キャッチコピー作成の目的を一言で教えてください。";
+                    var newState = ElicitationState.CreateNew();
+                    await accessor.SetAsync(turnContext, newState, cancellationToken);
+                    await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    await turnContext.SendActivityAsync(MessageFactory.Text(guidance, guidance), cancellationToken);
+                    return new InvokeResponse { Status = 200 };
+                }
+                else
+                {
+                    var err = $"Excel出力失敗: {result.Error ?? "不明なエラー"}";
+                    await turnContext.SendActivityAsync(MessageFactory.Text(err, err), cancellationToken);
+                }
+                await accessor.SetAsync(turnContext, state, cancellationToken);
+                await _userState.SaveChangesAsync(turnContext, false, cancellationToken);
+            }
+        }
+        var resp = await base.OnInvokeActivityAsync(turnContext, cancellationToken);
+        return resp ?? new InvokeResponse { Status = 200 };
     }
 
     protected override async Task OnMessageActivityAsync(ITurnContext<IMessageActivity> turnContext, CancellationToken cancellationToken)
@@ -55,6 +409,59 @@ public class SimpleBot : ActivityHandler
                 state = await accessor.GetAsync(turnContext, () => ElicitationState.CreateNew(), cancellationToken);
             }
 
+            // 先に /forceauth を処理（auto-run と競合させない）
+            var rawLower = text.Trim().ToLowerInvariant();
+            if (rawLower == "/forceauth")
+            {
+                if (_conversationState != null && _mainDialog != null)
+                {
+                    var dialogStateAccessor = _conversationState.CreateProperty<DialogState>("DialogState");
+                    Console.WriteLine("[OAUTH][Force] MainDialog invoked by user (pre-auto-run phase)");
+                    await _mainDialog.RunAsync(turnContext, dialogStateAccessor, cancellationToken);
+                    await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    await turnContext.SendActivityAsync(MessageFactory.Text("サインイン処理を開始しました。カードが表示されない場合は Teams のキャッシュクリア（Ctrl+R または 完全再起動）を試してください。", "サインイン処理を開始しました。"), cancellationToken);
+                }
+                else
+                {
+                    await turnContext.SendActivityAsync(MessageFactory.Text("会話状態が初期化されていないため OAuthPrompt を開始できません。", "会話状態が初期化されていないため OAuthPrompt を開始できません。"), cancellationToken);
+                }
+                return;
+            }
+
+            // /signin コマンド: Step 進行状況に関係なく明示的に OAuthPrompt を起動
+            if (rawLower == "/signin")
+            {
+                if (_conversationState != null && _mainDialog != null)
+                {
+                    var dialogStateAccessor = _conversationState.CreateProperty<DialogState>("DialogState");
+                    Console.WriteLine("[OAUTH][SigninCmd] MainDialog invoked by user (/signin)");
+                    await _mainDialog.RunAsync(turnContext, dialogStateAccessor, cancellationToken);
+                    await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    await turnContext.SendActivityAsync(MessageFactory.Text("サインインカードを表示します。表示されない場合は /oauthdiag で状態を確認してください。", "サインインカードを表示します。"), cancellationToken);
+                }
+                else
+                {
+                    await turnContext.SendActivityAsync(MessageFactory.Text("会話状態が初期化されていないため OAuthPrompt を開始できません。", "会話状態が初期化されていないため OAuthPrompt を開始できません。"), cancellationToken);
+                }
+                return;
+            }
+
+            // === OAuthPrompt 実行トリガ ===
+            // 条件: まだトークン未取得 かつ (Step6 以降に到達 / サインイン待機フラグ) の場合に自動実行。
+            if (_conversationState != null && _mainDialog != null)
+            {
+                // /forceauth コマンドのターンでは自動起動をスキップ（同一ターン二重実行防止）
+                var isForceAuthCommand = string.Equals(text.Trim(), "/forceauth", StringComparison.OrdinalIgnoreCase);
+                var needAuth = !isForceAuthCommand && string.IsNullOrWhiteSpace(state.DelegatedGraphToken) && (state.Step6Completed || state.Step7Completed || state.WaitingForSignIn);
+                if (needAuth)
+                {
+                    var dialogStateAccessor = _conversationState.CreateProperty<DialogState>("DialogState");
+                    Console.WriteLine("[OAUTH][AutoRun] MainDialog invoked (reason=needAuth)");
+                    await _mainDialog.RunAsync(turnContext, dialogStateAccessor, cancellationToken);
+                    await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                }
+            }
+
             // === セッション完了後の自動リセットガード ===
             // 直前に Step8 が完了しているが、新しいガイダンス前にユーザーが素早く入力した場合、旧 state の履歴を引きずる可能性がある。
             // Completed セッションにユーザーが通常メッセージを送ったら自動で新規セッションを開始し、その最初のメッセージとして扱う。
@@ -74,6 +481,160 @@ public class SimpleBot : ActivityHandler
             // /reset コマンド（大小文字・全角半角空白を許容簡易）
             var trimmed = text.Trim();
             var lower = trimmed.ToLowerInvariant();
+            if (lower == "/authstatus")
+            {
+                var diag = new List<string>();
+                diag.Add("— Auth Status —");
+                diag.Add($"WaitingForSignIn: {state.WaitingForSignIn}");
+                diag.Add($"ConnectionName: {Environment.GetEnvironmentVariable("BOT_OAUTH_CONNECTION_NAME") ?? "GraphDelegated"}");
+                diag.Add($"Step8Completed: {state.Step8Completed}");
+                diag.Add($"LastTokenAttemptUtc: {state.LastTokenAttemptUtc:O}");
+                    if (!string.IsNullOrWhiteSpace(state.DelegatedGraphToken)) diag.Add("DelegatedGraphToken: (present)");
+                if (!string.IsNullOrWhiteSpace(state.LastTokenResult)) diag.Add($"LastTokenResult: {state.LastTokenResult}");
+                if (!string.IsNullOrWhiteSpace(state.LastDelegatedTokenPreview)) diag.Add($"TokenPreview: {state.LastDelegatedTokenPreview}");
+                var msgDiag = string.Join("\n", diag);
+                Console.WriteLine("[DEBUG][SSO] /authstatus -> " + msgDiag.Replace("\n", " | "));
+                await turnContext.SendActivityAsync(MessageFactory.Text(msgDiag, msgDiag), cancellationToken);
+                return;
+            }
+
+            if (lower == "/oauthdiag")
+            {
+                var lines = new List<string>();
+                lines.Add("— OAuth Diagnostics —");
+                lines.Add($"ConnectionName: {Environment.GetEnvironmentVariable("BOT_OAUTH_CONNECTION_NAME") ?? "GraphDelegated"}");
+                lines.Add($"PromptStartCount: {state.OAuthPromptStartCount}");
+                lines.Add($"PromptLastAttemptUtc: {state.OAuthPromptLastAttemptUtc:O}");
+                lines.Add($"LastTokenAcquiredUtc: {state.LastTokenAcquiredUtc:O}");
+                lines.Add($"DelegatedTokenPresent: {!string.IsNullOrWhiteSpace(state.DelegatedGraphToken)}");
+                lines.Add($"WaitingForSignIn: {state.WaitingForSignIn}");
+                var txt = string.Join("\n", lines);
+                await turnContext.SendActivityAsync(MessageFactory.Text(txt, txt), cancellationToken);
+                return;
+            }
+
+            if (lower == "/forceauth")
+            {
+                if (_conversationState != null && _mainDialog != null)
+                {
+                    var dialogStateAccessor = _conversationState.CreateProperty<DialogState>("DialogState");
+                    Console.WriteLine("[OAUTH][Force] MainDialog invoked by user");
+                    await _mainDialog.RunAsync(turnContext, dialogStateAccessor, cancellationToken);
+                    await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    await turnContext.SendActivityAsync(MessageFactory.Text("サインイン処理を開始しました。カードが表示されない場合は Teams のキャッシュクリアやアプリ再インストールをお試しください。", "サインイン処理を開始しました。"), cancellationToken);
+                }
+                else
+                {
+                    await turnContext.SendActivityAsync(MessageFactory.Text("会話状態が初期化されていないため OAuthPrompt を開始できません。", "会話状態が初期化されていないため OAuthPrompt を開始できません。"), cancellationToken);
+                }
+                return;
+            }
+
+            if (lower == "/signin")
+            {
+                // /signin コマンドは OAuthPrompt へ移行したため廃止
+            }
+
+            if (lower == "/tokenretry")
+            {
+                // /tokenretry も削除（OAuthPrompt へ統一）
+            }
+
+            if (lower == "/signinurl")
+            {
+                // /signinurl も削除
+            }
+
+            // 手動で Step8 (Excel 出力) を試行するためのデバッグコマンド
+            if (lower == "/excel" || lower == "/step8")
+            {
+                // /excel, /step8 コマンドは削除 (自動フローのみ)
+            }
+
+            // SSO / OAuth の設定ガイドを表示
+            if (lower == "/ssohelp" || lower == "/oauthhelp")
+            {
+                var lines = new List<string>();
+                lines.Add("— SSO / OAuth 診断ガイド —");
+                lines.Add("1. Azure Portal > Bot Channels Registration で OAuth Connection (例: GraphDelegated) を作成");
+                lines.Add("   - Service Provider: Azure Active Directory v2");
+                lines.Add("   - Scopes 例: offline_access openid profile User.Read Files.ReadWrite.All Sites.ReadWrite.All");
+                lines.Add("2. BOT_OAUTH_CONNECTION_NAME 環境変数が接続名と一致しているか確認");
+                lines.Add("3. Teams アプリの再インストール / キャッシュクリア (サインインカードが出ない場合)");
+                lines.Add("4. /configcheck で UserTokenClientInTurnState=True を確認 (False の場合は AppId/Password 不整合)");
+                lines.Add("5. /signin コマンドで明示的にサインインカードを表示できます");
+                lines.Add("6. サインイン後、自動イベント (signin/verifyState, tokens/response) が届くと Step8 再開");
+                lines.Add("7. 失敗時 /tokenretry で再取得、/signinurl でブラウザ直接サインインを試行");
+                lines.Add("8. AAD 側リダイレクト URL: https://token.botframework.com/.auth/web/redirect を含めること");
+                var help = string.Join("\n", lines);
+                await turnContext.SendActivityAsync(MessageFactory.Text(help, help), cancellationToken);
+                return;
+            }
+
+            if (lower == "/configcheck")
+            {
+                string GetEnv(string k) => Environment.GetEnvironmentVariable(k) ?? "<null>";
+                var lines = new List<string>();
+                lines.Add("— Config Check —");
+                lines.Add($"MicrosoftAppId: {MaskMid(GetEnv("MicrosoftAppId"))}");
+                var pwd = GetEnv("MicrosoftAppPassword");
+                lines.Add($"MicrosoftAppPassword: {(pwd=="<null>"?"<null>":$"len={pwd.Length}")}");
+                lines.Add($"MicrosoftAppTenantId: {GetEnv("MicrosoftAppTenantId")}");
+                lines.Add($"MicrosoftAppType: {GetEnv("MicrosoftAppType")}");
+                lines.Add($"BOT_OAUTH_CONNECTION_NAME: {GetEnv("BOT_OAUTH_CONNECTION_NAME")}");
+                // TurnState introspection
+                bool tokenClientFound = false;
+                foreach (var kv in turnContext.TurnState)
+                {
+                    var t = kv.Value?.GetType();
+                    if (t?.FullName == "Microsoft.Bot.Builder.Integration.AspNet.Core.UserTokenClient" || t?.FullName == "Microsoft.Bot.Connector.Authentication.UserTokenClientImpl") tokenClientFound = true;
+                }
+                lines.Add($"UserTokenClientInTurnState: {tokenClientFound}");
+                if (!tokenClientFound)
+                {
+                    lines.Add("(原因候補) AppId/Password 未設定 または 認証無効モード / OAuth Connection 不整合");
+                }
+                var txt = string.Join("\n", lines);
+                Console.WriteLine("[DEBUG][CFG] /configcheck -> " + txt.Replace("\n"," | "));
+                await turnContext.SendActivityAsync(MessageFactory.Text(txt, txt), cancellationToken);
+                return;
+            }
+
+            if (lower == "/turnstate")
+            {
+                var keys = new List<string>();
+                foreach (var kv in turnContext.TurnState)
+                {
+                    var t = kv.Value?.GetType();
+                    keys.Add(t?.FullName ?? kv.Key ?? "<unknown>");
+                }
+                if (keys.Count == 0) keys.Add("<empty>");
+                var txt = "— TurnState Keys —\n" + string.Join("\n", keys);
+                Console.WriteLine("[DEBUG][TURNSTATE] " + txt.Replace("\n"," | "));
+                await turnContext.SendActivityAsync(MessageFactory.Text(txt, txt), cancellationToken);
+                return;
+            }
+
+            if (lower == "/authdump" || lower == "/activity")
+            {
+                var a = turnContext.Activity;
+                var lines = new List<string>();
+                lines.Add("— Activity Dump —");
+                lines.Add($"Type: {a.Type}");
+                if (a is IEventActivity ev && !string.IsNullOrWhiteSpace(ev.Name)) lines.Add($"Name: {ev.Name}");
+                else if (a is IInvokeActivity inv && !string.IsNullOrWhiteSpace(inv.Name)) lines.Add($"Name: {inv.Name}");
+                lines.Add($"ChannelId: {a.ChannelId}");
+                lines.Add($"From.Id: {a.From?.Id}");
+                lines.Add($"Conversation.Id: {a.Conversation?.Id}");
+                if (!string.IsNullOrWhiteSpace(a.Text)) lines.Add($"Text: {TrimForDump(a.Text,120)}");
+                if (a.Value != null) lines.Add($"ValueType: {a.Value.GetType().Name}");
+                if (a.Attachments != null && a.Attachments.Any()) lines.Add($"Attachments: {a.Attachments.Count}");
+                var dump = string.Join("\n", lines);
+                Console.WriteLine("[DEBUG][DUMP] " + dump.Replace("\n"," | "));
+                await turnContext.SendActivityAsync(MessageFactory.Text(dump, dump), cancellationToken);
+                return;
+            }
+
             if (lower == "/reset" || lower == "reset" || lower == "リセット" || lower == "最初から" || lower == "新規" ||
                 lower == "/new" || lower == "new" || lower == "/start" || lower == "start" || lower == "別件" || lower == "別の")
             {
@@ -1771,7 +2332,36 @@ public class SimpleBot : ActivityHandler
                 turnContext.SendActivityAsync(MessageFactory.Text(matrixMsg, matrixMsg), cancellationToken).GetAwaiter().GetResult();
             });
 
-            var result = await _oneDriveExcelService.CreateAndFillExcelAsync(progress, state.TaglineSummaryJson, cancellationToken);
+            // OAuthPrompt により state に保存されたトークンを利用
+            string? delegatedToken = state.DelegatedGraphToken;
+
+            // トークン未取得ならサインインカードを提示して終了
+            if (string.IsNullOrWhiteSpace(delegatedToken))
+            {
+                // トークンがない → Dialog (OAuthPrompt) が次ターンでサインインカードを提示するのでガイドのみ
+                if (!state.WaitingForSignIn) state.WaitingForSignIn = true;
+                var guide = "OneDrive へのアクセス許可がまだ付与されていません。サインインカードを表示しますので認証を完了してください。";
+                await turnContext.SendActivityAsync(MessageFactory.Text(guide, guide), cancellationToken);
+                // 同一ターン内で即時 OAuthPrompt を起動（従来は次ターンまで待っていた）
+                if (_conversationState != null && _mainDialog != null)
+                {
+                    try
+                    {
+                        var dialogStateAccessor = _conversationState.CreateProperty<DialogState>("DialogState");
+                        Console.WriteLine("[OAUTH][Inline] MainDialog invoked from Step8 (no token)");
+                        await _mainDialog.RunAsync(turnContext, dialogStateAccessor, cancellationToken);
+                        await _conversationState.SaveChangesAsync(turnContext, false, cancellationToken);
+                    }
+                    catch (Exception exInline)
+                    {
+                        Console.WriteLine("[OAUTH][Inline][ERROR] " + exInline.Message);
+                        await turnContext.SendActivityAsync(MessageFactory.Text("サインインカードの起動に失敗しました: " + exInline.Message), cancellationToken);
+                    }
+                }
+                return false;
+            }
+
+            var result = await _oneDriveExcelService.CreateAndFillExcelAsync(progress, state.TaglineSummaryJson, cancellationToken, delegatedToken);
             if (result.IsSuccess && !string.IsNullOrWhiteSpace(result.WebUrl))
             {
                 var done = $"Excel出力完了: {result.WebUrl}";
@@ -1819,6 +2409,10 @@ public class SimpleBot : ActivityHandler
 public class ElicitationState
 {
     public List<string> History { get; } = new List<string>();
+    // SSO サインイン待機中フラグ (Excel 出力直前にトークン未取得だった場合 SignInCard 送信し true)
+    public bool WaitingForSignIn { get; set; } = false;
+    // OAuthPrompt で取得した Graph 委任トークン（ランタイム短期保存。長期保存不要）
+    public string? DelegatedGraphToken { get; set; }
     public string? FinalPurpose { get; set; }
     public string SessionId { get; set; } = Guid.NewGuid().ToString();
     public DateTimeOffset StartedUtc { get; set; } = DateTimeOffset.UtcNow;
@@ -1855,6 +2449,14 @@ public class ElicitationState
     public string? ConstraintLegal { get; set; }
     public string? ConstraintOther { get; set; }
     // Step6（クリエイティブ要素）: 質問カウント不要
+    // --- Diagnostics (SSO) ---
+    public DateTimeOffset? LastTokenAttemptUtc { get; set; }
+    public string? LastTokenResult { get; set; } // success / null / exception-message(short)
+    public string? LastDelegatedTokenPreview { get; set; } // masked
+    // OAuth diagnostics
+    public int OAuthPromptStartCount { get; set; } = 0;
+    public DateTimeOffset? OAuthPromptLastAttemptUtc { get; set; }
+    public DateTimeOffset? LastTokenAcquiredUtc { get; set; }
 
     public static ElicitationState CreateNew()
     {

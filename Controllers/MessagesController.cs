@@ -10,10 +10,10 @@ namespace PhraseXross.Controllers
     [ApiController]
     public class MessagesController : ControllerBase
     {
-        private readonly CloudAdapter _adapter;
+    private readonly IBotFrameworkHttpAdapter _adapter;
         private readonly IBot _bot;
 
-        public MessagesController(CloudAdapter adapter, IBot bot)
+    public MessagesController(IBotFrameworkHttpAdapter adapter, IBot bot)
         {
             _adapter = adapter;
             _bot = bot;
