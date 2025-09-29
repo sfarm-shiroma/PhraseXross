@@ -10,7 +10,10 @@ public static class CreativeElementCategories
     //デバッグには多いので、一時的に２つに減らす
     public static readonly string[] All = new[]
     {
+        "状況",
         "課題・欲求",
+        "感情",
+        "温度感",
         "場・舞台・空間"
     };
 

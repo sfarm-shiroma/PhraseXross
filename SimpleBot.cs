@@ -22,6 +22,7 @@ public class SimpleBot : ActivityHandler
     private readonly OneDriveExcelService? _oneDriveExcelService; // optional (OneDrive 連携)
         private readonly PhraseXross.Dialogs.MainDialog _mainDialog; // OAuthPrompt を含む Dialog
         private readonly ConversationState? _conversationState;
+        private const string UnifiedWelcomeMessage = "こんにちは。今日はどんな言葉づくりをお手伝いしましょう？まずは、差し支えなければ『何の活動のためのコピーか』を教えてください。（例：イベント告知／販促キャンペーン／ブランド認知／採用 など）";
 
         public SimpleBot(Kernel? kernel = null, UserState? userState = null, OneDriveExcelService? oneDriveExcelService = null, PhraseXross.Dialogs.MainDialog? mainDialog = null, ConversationState? conversationState = null)
         {
@@ -165,6 +166,15 @@ public class SimpleBot : ActivityHandler
             }
         }
         return delegatedToken;
+    }
+
+    // 全ての初期ウェルカム送信を無効化する共通判定
+    private static bool IsWelcomeDisabled()
+    {
+        var v = Environment.GetEnvironmentVariable("PX_DISABLE_WELCOME");
+        // 未設定時はデフォルトで無効化 (true)
+        if (string.IsNullOrWhiteSpace(v)) return true;
+        return v.Equals("true", StringComparison.OrdinalIgnoreCase) || v == "1" || v.Equals("yes", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<string?> TryGetSignInUrlAsync(ITurnContext turnContext, CancellationToken cancellationToken)
@@ -421,11 +431,11 @@ public class SimpleBot : ActivityHandler
             //   - 入力がコマンド (/ で始まる) ではない
             //   - Reset 系での再開直後を除く (History.Count == 0 を条件とする)
             var isAnyStepCompleted = state.Step1Completed || state.Step2Completed || state.Step3Completed || state.Step4Completed || state.Step5Completed || state.Step6Completed || state.Step7Completed || state.Step8Completed;
-            var disableFallbackWelcome = string.Equals(Environment.GetEnvironmentVariable("PX_DISABLE_FALLBACK_WELCOME"), "true", StringComparison.OrdinalIgnoreCase)
+            var disableFallbackWelcome = IsWelcomeDisabled() || string.Equals(Environment.GetEnvironmentVariable("PX_DISABLE_FALLBACK_WELCOME"), "true", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(Environment.GetEnvironmentVariable("PX_DISABLE_FALLBACK_WELCOME"), "1", StringComparison.OrdinalIgnoreCase);
             if (!disableFallbackWelcome && !isAnyStepCompleted && !state.WelcomeSent && state.History.Count == 0 && state.Step1QuestionCount == 0 && !string.IsNullOrWhiteSpace(text) && !text.TrimStart().StartsWith("/"))
             {
-                var fallbackWelcome = "こんにちは。今日はどんな言葉づくりをお手伝いしましょう？まずは、差し支えなければ『何の活動のためのコピーか』を教えてください。（例：イベント告知／販促キャンペーン／ブランド認知／採用 など）";
+                var fallbackWelcome = UnifiedWelcomeMessage;
                 // ユーザー最初の発話が既に同内容（コピペ等）の場合は抑止
                 var normalizedUser = text.Replace("\\s+", " ").Trim();
                 var normalizedWelcome = fallbackWelcome.Replace("\\s+", " ").Trim();
@@ -766,6 +776,7 @@ public class SimpleBot : ActivityHandler
             {
                 // まず、ターゲットが十分に固まっているかを評価
                 var tEval = await EvaluateTargetAsync(_kernel, transcript, state.Step1SummaryJson, cancellationToken);
+                if (tEval != null) state.LastTargetReason = tEval.Reason;
                 if (tEval != null && tEval.IsSatisfied)
                 {
                     state.FinalTarget = string.IsNullOrWhiteSpace(tEval.Target) ? state.FinalTarget : tEval.Target;
@@ -782,10 +793,10 @@ public class SimpleBot : ActivityHandler
                     await SendSummaryAsync(turnContext, consolidatedAfterStep2, cancellationToken);
 
                     // Step3（媒体/利用シーン）へ最初の短い質問を投げる（元の自動遷移ロジックを復元）
-                    var mFirst = await GenerateNextMediaQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step3QuestionCount, cancellationToken);
+                    var mFirst = await GenerateNextMediaQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step3QuestionCount, state.LastMediaReason, cancellationToken);
                     if (string.IsNullOrWhiteSpace(mFirst))
                     {
-                        mFirst = await GenerateNextMediaQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step3QuestionCount, cancellationToken);
+                        mFirst = await GenerateNextMediaQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step3QuestionCount, state.LastMediaReason, cancellationToken);
                     }
                     if (!string.IsNullOrWhiteSpace(mFirst))
                     {
@@ -807,12 +818,12 @@ public class SimpleBot : ActivityHandler
                 }
 
                 // 未確定: 既出の手がかりを踏まえて次のターゲット質問を生成
-                var tAsk = await GenerateNextTargetQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step2QuestionCount, cancellationToken);
+                var tAsk = await GenerateNextTargetQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step2QuestionCount, state.LastTargetReason, cancellationToken);
 
                 if (string.IsNullOrWhiteSpace(tAsk))
                 {
                     // 1回だけAIに再試行
-                    tAsk = await GenerateNextTargetQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step2QuestionCount, cancellationToken);
+                    tAsk = await GenerateNextTargetQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step2QuestionCount, state.LastTargetReason, cancellationToken);
                 }
 
                 if (!string.IsNullOrWhiteSpace(tAsk))
@@ -840,6 +851,7 @@ public class SimpleBot : ActivityHandler
             {
                 // 既出の usageContext などを踏まえて十分性を評価
                 var mEval = await EvaluateMediaAsync(_kernel, transcript, state.Step1SummaryJson, cancellationToken);
+                if (mEval != null) state.LastMediaReason = mEval.Reason;
                 if (mEval != null && mEval.IsSatisfied)
                 {
                     state.FinalUsageContext = string.IsNullOrWhiteSpace(mEval.MediaOrContext) ? state.FinalUsageContext : mEval.MediaOrContext;
@@ -879,16 +891,31 @@ public class SimpleBot : ActivityHandler
                                 null,
                                 cancellationToken);
                         }
-                        // バリデーション（了承のみで質問しない応答を排除）
-                        if (IsInvalidCoreQuestion(coreFirst))
+                        if (IsInvalidCoreQuestion(coreFirst)) coreFirst = string.Empty;
+                        if (string.IsNullOrWhiteSpace(coreFirst))
                         {
-                            coreFirst = BuildDynamicCoreFallbackQuestion(transcript);
+                            // 再試行1: 明確化指示
+                            var booster1 = new ChatHistory();
+                            booster1.AddSystemMessage("前回の出力が空または無効でした。提供価値を一言で補足してもらうための短い質問を1つだけ返してください。30文字以内。列挙禁止。");
+                            booster1.AddUserMessage($"--- 会話履歴 ---\n{transcript}");
+                            var b1 = await InvokeAndLogAsync(_kernel, booster1, cancellationToken, "S4/CORE:Q-INIT-BOOST1");
+                            coreFirst = b1?.Content?.Trim();
+                            if (IsInvalidCoreQuestion(coreFirst)) coreFirst = string.Empty;
                         }
                         if (string.IsNullOrWhiteSpace(coreFirst))
                         {
-                            // フォールバック（AIが空応答だった場合でもユーザーを前に進ませる）
-                            coreFirst = "次に『提供価値・差別化のコア』を一言で教えていただけますか？例：地域ならではの温かさ／誰でもすぐ参加できる気軽さ など。";
-                            Console.WriteLine("[DEBUG] Core initial question fallback used (AI empty response)");
+                            // 再試行2: さらに制約強調
+                            var booster2 = new ChatHistory();
+                            booster2.AddSystemMessage("再試行: コアとなる価値を確定するための焦点質問を 1 つ返してください。『どれが近いですか』などの列挙は避け、単一質問のみ。");
+                            booster2.AddUserMessage($"--- 会話履歴 ---\n{transcript}");
+                            var b2 = await InvokeAndLogAsync(_kernel, booster2, cancellationToken, "S4/CORE:Q-INIT-BOOST2");
+                            coreFirst = b2?.Content?.Trim();
+                            if (IsInvalidCoreQuestion(coreFirst)) coreFirst = string.Empty;
+                        }
+                        if (string.IsNullOrWhiteSpace(coreFirst))
+                        {
+                            coreFirst = "提供価値の核心は？"; // 最終フェイルセーフ（短く中立）
+                            Console.WriteLine("[DEBUG] Core initial question ultimate fallback used (all retries empty)");
                         }
                         state.History.Add($"Assistant: {coreFirst}");
                         TrimHistory(state.History, 30);
@@ -917,10 +944,10 @@ public class SimpleBot : ActivityHandler
                 }
 
                 // 未確定: 既出の usageContext を活かして次の質問を生成
-                var mAsk = await GenerateNextMediaQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step3QuestionCount, cancellationToken);
+                var mAsk = await GenerateNextMediaQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step3QuestionCount, state.LastMediaReason, cancellationToken);
                 if (string.IsNullOrWhiteSpace(mAsk))
                 {
-                    mAsk = await GenerateNextMediaQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step3QuestionCount, cancellationToken);
+                    mAsk = await GenerateNextMediaQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step3QuestionCount, state.LastMediaReason, cancellationToken);
                 }
                 if (!string.IsNullOrWhiteSpace(mAsk))
                 {
@@ -946,6 +973,7 @@ public class SimpleBot : ActivityHandler
             if (state.Step1Completed && state.Step2Completed && state.Step3Completed && !state.Step4Completed)
             {
                 var cEval = await EvaluateCoreAsync(_kernel, transcript, state.Step1SummaryJson, state.FinalTarget, state.FinalUsageContext, cancellationToken);
+                if (cEval != null) state.LastCoreReason = cEval.Reason;
                 if (cEval != null && cEval.IsSatisfied)
                 {
                     state.FinalCoreValue = string.IsNullOrWhiteSpace(cEval.Core) ? state.FinalCoreValue : cEval.Core;
@@ -960,10 +988,24 @@ public class SimpleBot : ActivityHandler
                     Console.WriteLine($"[USER_MESSAGE] {consolidatedAfterStep4}");
                     await SendSummaryAsync(turnContext, consolidatedAfterStep4, cancellationToken);
 
-                    // 新Step5（制約事項ヒアリング）へ最初の質問を投げる
+                    // Step5（制約事項）初回: ハードコードせず LLM 生成を直接利用（ユーザー要望により固定文撤去）
                     if (!state.Step5Completed)
                     {
-                        var firstConstraintQ = GenerateInitialConstraintQuestion();
+                        var firstConstraintQ = await GenerateNextConstraintsQuestionAsync(
+                            _kernel,
+                            transcript,
+                            state.Step1SummaryJson,
+                            state.FinalTarget,
+                            state.FinalUsageContext,
+                            state.FinalCoreValue,
+                            state.Step5QuestionCount,
+                            state.LastConstraintsReason,
+                            cancellationToken);
+                        if (string.IsNullOrWhiteSpace(firstConstraintQ))
+                        {
+                            // モデル失敗時の最低限フォールバック（誘導語『特にない』等は含めない）
+                            firstConstraintQ = "制約事項（文字数・避けたい表現・法規・文化配慮など）で既に決まっている点があれば教えてください。";
+                        }
                         state.History.Add($"Assistant: {firstConstraintQ}");
                         TrimHistory(state.History, 30);
                         state.Step5QuestionCount++;
@@ -1004,9 +1046,29 @@ public class SimpleBot : ActivityHandler
                         cancellationToken);
                 }
 
-                if (IsInvalidCoreQuestion(cAsk))
+                if (IsInvalidCoreQuestion(cAsk)) cAsk = string.Empty;
+                if (string.IsNullOrWhiteSpace(cAsk))
                 {
-                    cAsk = BuildDynamicCoreFallbackQuestion(transcript);
+                    var booster1 = new ChatHistory();
+                    booster1.AddSystemMessage("前回のコア質問が空/無効でした。30文字以内で焦点を一つに絞った質問を1つ返してください。");
+                    booster1.AddUserMessage($"--- 会話履歴 ---\n{transcript}");
+                    var b1 = await InvokeAndLogAsync(_kernel, booster1, cancellationToken, "S4/CORE:Q-BOOST1B");
+                    cAsk = b1?.Content?.Trim();
+                    if (IsInvalidCoreQuestion(cAsk)) cAsk = string.Empty;
+                }
+                if (string.IsNullOrWhiteSpace(cAsk))
+                {
+                    var booster2 = new ChatHistory();
+                    booster2.AddSystemMessage("再試行: コア提供価値を確定するための一点集中の質問を1つだけ返してください。列挙や複数質問は禁止。");
+                    booster2.AddUserMessage($"--- 会話履歴 ---\n{transcript}");
+                    var b2 = await InvokeAndLogAsync(_kernel, booster2, cancellationToken, "S4/CORE:Q-BOOST2B");
+                    cAsk = b2?.Content?.Trim();
+                    if (IsInvalidCoreQuestion(cAsk)) cAsk = string.Empty;
+                }
+                if (string.IsNullOrWhiteSpace(cAsk))
+                {
+                    cAsk = "コア価値は？"; // 中立フェイルセーフ
+                    Console.WriteLine("[DEBUG] Core iterative question ultimate fallback used (all retries empty)");
                 }
 
                 if (!string.IsNullOrWhiteSpace(cAsk))
@@ -1032,6 +1094,7 @@ public class SimpleBot : ActivityHandler
             if (state.Step1Completed && state.Step2Completed && state.Step3Completed && state.Step4Completed && !state.Step5Completed)
             {
                 var consEval = await EvaluateConstraintsAsync(_kernel, transcript, state.Step1SummaryJson, state.FinalTarget, state.FinalUsageContext, state.FinalCoreValue, cancellationToken);
+                if (consEval != null) state.LastConstraintsReason = consEval.Reason;
                 if (consEval != null && consEval.IsSatisfied)
                 {
                     state.ConstraintCharacterLimit = string.IsNullOrWhiteSpace(consEval.CharacterLimit) ? state.ConstraintCharacterLimit : consEval.CharacterLimit;
@@ -1074,10 +1137,10 @@ public class SimpleBot : ActivityHandler
                 }
 
                 // 未確定: 次の制約確認質問
-                var nextConsQ = await GenerateNextConstraintsQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.FinalTarget, state.FinalUsageContext, state.FinalCoreValue, state.Step5QuestionCount, cancellationToken);
+                var nextConsQ = await GenerateNextConstraintsQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.FinalTarget, state.FinalUsageContext, state.FinalCoreValue, state.Step5QuestionCount, state.LastConstraintsReason, cancellationToken);
                 if (string.IsNullOrWhiteSpace(nextConsQ))
                 {
-                    nextConsQ = await GenerateNextConstraintsQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.FinalTarget, state.FinalUsageContext, state.FinalCoreValue, state.Step5QuestionCount, cancellationToken);
+                    nextConsQ = await GenerateNextConstraintsQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.FinalTarget, state.FinalUsageContext, state.FinalCoreValue, state.Step5QuestionCount, state.LastConstraintsReason, cancellationToken);
                 }
                 if (!string.IsNullOrWhiteSpace(nextConsQ))
                 {
@@ -1116,6 +1179,7 @@ public class SimpleBot : ActivityHandler
 
             // Step1: 目的評価
             var eval = await EvaluatePurposeAsync(_kernel, transcript, cancellationToken);
+            if (eval != null) state.LastPurposeReason = eval.Reason;
             if (eval != null && eval.IsSatisfied)
             {
                 // 目的が十分に引き出せたと判断された場合
@@ -1145,10 +1209,10 @@ public class SimpleBot : ActivityHandler
                 state.Step1Completed = true;
 
                 // 直後にStep2（ターゲット）への最初の短い質問を1つだけ行う
-                var tFirst = await GenerateNextTargetQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step2QuestionCount, cancellationToken);
+                var tFirst = await GenerateNextTargetQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step2QuestionCount, state.LastTargetReason, cancellationToken);
                 if (string.IsNullOrWhiteSpace(tFirst))
                 {
-                    tFirst = await GenerateNextTargetQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step2QuestionCount, cancellationToken);
+                    tFirst = await GenerateNextTargetQuestionAsync(_kernel, transcript, state.Step1SummaryJson, state.Step2QuestionCount, state.LastTargetReason, cancellationToken);
                 }
                 if (!string.IsNullOrWhiteSpace(tFirst))
                 {
@@ -1171,12 +1235,12 @@ public class SimpleBot : ActivityHandler
             }
 
             // 未確定: Elicitor に次の質問を生成（Step1用）
-            var ask = await GenerateNextQuestionAsync(_kernel, transcript, state.Step1QuestionCount, cancellationToken);
+            var ask = await GenerateNextQuestionAsync(_kernel, transcript, state.Step1QuestionCount, state.LastPurposeReason, cancellationToken);
 
             if (string.IsNullOrWhiteSpace(ask))
             {
                 // 1回だけAIに再試行（テンプレ固定文なし）
-                ask = await GenerateNextQuestionAsync(_kernel, transcript, state.Step1QuestionCount, cancellationToken);
+                ask = await GenerateNextQuestionAsync(_kernel, transcript, state.Step1QuestionCount, state.LastPurposeReason, cancellationToken);
             }
 
             if (!string.IsNullOrWhiteSpace(ask))
@@ -1216,9 +1280,9 @@ public class SimpleBot : ActivityHandler
         var botId = activity.Recipient?.Id;
 
         bool userJoined = membersAdded != null && membersAdded.Any(m => m.Id != null && m.Id != botId);
-        if (userJoined)
+        if (userJoined && !IsWelcomeDisabled())
         {
-            var welcomeMessage = "こんにちは。今日はどんな言葉づくりをお手伝いしましょう？まずは、差し支えなければ『何の活動のためのコピーか』を教えてください。（例：イベント告知／販促キャンペーン／ブランド認知／採用 など）";
+            var welcomeMessage = UnifiedWelcomeMessage;
 
             if (_userState != null)
             {
@@ -1228,8 +1292,9 @@ public class SimpleBot : ActivityHandler
                 {
                     // 直前にフォールバックで既に送っているケースを保険的に検知（履歴末尾と比較）
                     var lastAssistant = state.History.LastOrDefault(h => h.StartsWith("Assistant:"));
-                    var normalizedExisting = lastAssistant?.Replace("\\s+", " ") ?? string.Empty;
-                    var normalizedWelcome = ("Assistant: " + welcomeMessage).Replace("\\s+", " ");
+                    string Normalize(string s) => Regex.Replace(s, "\\s+", " ").Trim();
+                    var normalizedExisting = lastAssistant is null ? string.Empty : Normalize(lastAssistant);
+                    var normalizedWelcome = Normalize("Assistant: " + welcomeMessage);
                     if (!string.Equals(normalizedExisting, normalizedWelcome, StringComparison.Ordinal))
                     {
                         Console.WriteLine($"[USER_MESSAGE] {welcomeMessage}");
@@ -1261,6 +1326,19 @@ public class SimpleBot : ActivityHandler
         }
     }
 
+    // ユーザーが「次へ進みたい/スキップしたい」明示を含むか簡易判定
+    private static bool UserWantsAdvance(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        var t = text.Trim();
+        string[] patterns = { "次へ", "次に進", "次いこ", "次行", "次のステップ", "先へ", "先に進", "スキップ", "skip", "もういい", "大丈夫です", "進んで", "進めて", "省略", "飛ばして" };
+        foreach (var p in patterns)
+        {
+            if (t.Contains(p, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
+    }
+
     // 目的受領時の承知メッセージをAIに1文で生成させる
     private static async Task<string?> GenerateAckMessageAsync(Kernel kernel, string transcript, string purpose, CancellationToken ct)
     {
@@ -1285,6 +1363,14 @@ public class SimpleBot : ActivityHandler
             判定基準：
             - 誰に向けたコピーかが1行で説明できること（例：関東圏の大学1〜2年生、既存のライトユーザー など）
             - 既出の事実に基づくこと（推測や新規追加はしない）
+
+            【ユーザー質問優先ルール（再定義）】
+            - 対象は『ユーザーが Assistant に情報/説明を求める明示的質問』のみ。
+            - 直近発話にその種の未回答質問が含まれ、まだ Assistant が回答していない場合のみ isSatisfied=false。
+            - ユーザーがこちらの質問に答えず保留/拒否/スキップ（例: 「まだ」「特にない」「次へ」等）しただけなら未回答扱いにしない。
+            - 『次へ』『スキップ』『もういい』など前進希望があれば本ルール適用せず他基準のみで判定。
+            - 未回答がある場合 reason を『未回答ユーザー質問: 要点…』で始め1行。無ければ不足指摘のみ。
+            - JSON 内でその質問へ直接回答しない。
 
             出力は次のJSONのみ（先頭や末尾に ``` や ```json などのコードフェンスや説明文を付けない）：
             {
@@ -1312,27 +1398,42 @@ public class SimpleBot : ActivityHandler
     }
 
     // Step2: 次のターゲット確認質問を生成（既出の手がかりを活かす）
-    private static async Task<string?> GenerateNextTargetQuestionAsync(Kernel kernel, string transcript, string? step1SummaryJson, int questionCount, CancellationToken ct)
+    private static async Task<string?> GenerateNextTargetQuestionAsync(Kernel kernel, string transcript, string? step1SummaryJson, int questionCount, string? evalReason, CancellationToken ct)
     {
         var history = new ChatHistory();
         var pacing = questionCount >= 4
             ? "（質問が続いているため、深掘りは控えめに。2〜3個の選択肢を各1行で示し、『どれが近い？／他にありますか？』とだけ確認）"
             : string.Empty;
+        var reasonSnippet = string.IsNullOrWhiteSpace(evalReason) ? string.Empty : $"直前の評価で不足とされた点: {evalReason}\n";
         history.AddSystemMessage(@$"あなたはやさしく話すマーケティングのプロです。工程名は出さず、自然な対話で『ターゲット』だけを確かめます。
+            {reasonSnippet}
             既出の手がかり（Step1要約のaudienceやtargetHints、会話内の記述）を尊重し、重複確認は手短に。許可ベースで短く1つだけ質問してください{pacing}。
 
             ターゲット以外（目的の再評価、表現案、制作条件など）は扱いません（別フェーズ）。
 
+            不足Reasonがある場合はその原文を羅列せず、自然な言い換えで 1 点だけギャップを埋める質問にしてください。
+
             必要に応じて2〜3個の候補（各1行）を示し、『どれが近いですか？／他にありますか？』と軽く確認するのはOKです。
 
-            出力はユーザーにそのまま見せる日本語のテキストのみ。");
+            【未回答質問ブリッジ】(evalReason に「未回答」が含まれる場合のみ)
+            - 先に未回答ユーザー質問へ 1 行で簡潔に回答（要点を自然に言い換え、引用丸写し禁止）
+            - その流れでターゲット像の不足 1 点に絞った質問を 1 つだけ提示
+            - 回答と質問は '。' でつなぐか 1 文にまとめる。複数質問は禁止
+            - 回答のみで十分なら「他にターゲット像で補足があれば教えてください。」等で締めてもよい
+
+            出力はユーザーにそのまま見せる日本語のテキストのみ。評価理由のコピーペーストは禁止。");
         var contextBlock = string.IsNullOrWhiteSpace(step1SummaryJson)
             ? "(Step1要約なし)"
             : step1SummaryJson;
         history.AddUserMessage($"--- Step1要約JSON（参考） ---\n{contextBlock}\n\n--- 会話履歴 ---\n{transcript}");
 
     var response = await InvokeAndLogAsync(kernel, history, ct, "S2/TARGET:Q");
-        return response?.Content?.Trim();
+        var tq = response?.Content?.Trim();
+        if (!string.IsNullOrWhiteSpace(tq) && questionCount >= 2 && tq.Length < 140 && !tq.Contains("次へ"))
+        {
+            tq += " （十分であれば『次へ』とだけ返信で先に進みます）";
+        }
+        return tq;
     }
 
     // Step3: 媒体/利用シーンが十分に定義されたかを評価
@@ -1346,6 +1447,12 @@ public class SimpleBot : ActivityHandler
             判定基準：
             - 媒体／利用シーンが1行で説明できること（例：特設LPのファーストビュー、店頭A1ポスター など）
             - 既出の事実に基づくこと（推測や新規追加はしない）
+
+            【ユーザー質問優先ルール（再定義）】
+            - Assistant への説明/判断を求める未回答質問が直近発話に残っている場合のみ isSatisfied=false。
+            - 「特にない」「決めてない」「次へ進んで」等は質問ではないため無視。
+            - 前進希望（次へ/スキップ等）があれば本ルールを適用せず他基準のみで判定。
+            - 未回答がある場合 reason を『未回答ユーザー質問: 要点…』で始め 1 行。無ければ不足/確定理由のみ。
 
             出力は次のJSONのみ（コードフェンスや説明文禁止）：
             {
@@ -1366,26 +1473,41 @@ public class SimpleBot : ActivityHandler
     }
 
     // Step3: 次の媒体確認質問を生成（既出の手がかりを活かす）
-    private static async Task<string?> GenerateNextMediaQuestionAsync(Kernel kernel, string transcript, string? step1SummaryJson, int questionCount, CancellationToken ct)
+    private static async Task<string?> GenerateNextMediaQuestionAsync(Kernel kernel, string transcript, string? step1SummaryJson, int questionCount, string? evalReason, CancellationToken ct)
     {
         var history = new ChatHistory();
         var pacing = questionCount >= 4
             ? "（質問が続いているため、深掘りは控えめに。2〜3個の選択肢を各1行で示し、『どれが近い？／他にありますか？』とだけ確認）"
             : string.Empty;
+        var reasonSnippet = string.IsNullOrWhiteSpace(evalReason) ? string.Empty : $"直前の評価で不足とされた点: {evalReason}\n";
         history.AddSystemMessage(@$"あなたはやさしく話すマーケティングのプロです。工程名は出さず、自然な対話で『媒体／利用シーン』だけを確かめます。
+            {reasonSnippet}
             既出の手がかり（Step1要約のusageContext、会話内の記述）を尊重し、重複確認は手短に。許可ベースで短く1つだけ質問してください{pacing}。
 
             媒体以外（目的やターゲットの再確認、表現案、制作条件など）は扱いません（別フェーズ）。
 
+            不足Reasonがある場合は原文丸写しを避け、自然な言い換えで 1 点だけギャップを埋める質問にしてください。
+
             必要に応じて2〜3個の候補（各1行）を示し、『どれが近いですか？／他にありますか？』と軽く確認するのはOKです。
 
-            出力はユーザーにそのまま見せる日本語のテキストのみ。");
+            【未回答質問ブリッジ】(evalReason に「未回答」が含まれる場合のみ)
+            - 先に未回答ユーザー質問へ 1 行で簡潔に回答（要点の自然な言い換え）
+            - 続けて媒体/利用シーンの不足 1 点を埋める質問を 1 つだけ提示
+            - 回答と質問は '。' でつなぐか 1 文にまとめる。複数質問は禁止
+            - 回答のみで十分なら「他に媒体や利用シーンで足りない点があれば教えてください。」等で締めてもよい
+
+            出力はユーザーにそのまま見せる日本語のテキストのみ。評価理由のコピーペーストは禁止。");
         var contextBlock = string.IsNullOrWhiteSpace(step1SummaryJson)
             ? "(Step1要約なし)"
             : step1SummaryJson;
         history.AddUserMessage($"--- Step1要約JSON（参考） ---\n{contextBlock}\n\n--- 会話履歴 ---\n{transcript}");
     var response = await InvokeAndLogAsync(kernel, history, ct, "S3/MEDIA:Q");
-        return response?.Content?.Trim();
+        var mq = response?.Content?.Trim();
+        if (!string.IsNullOrWhiteSpace(mq) && questionCount >= 2 && mq.Length < 140 && !mq.Contains("次へ"))
+        {
+            mq += " （十分であれば『次へ』とだけ返信で先に進みます）";
+        }
+        return mq;
     }
 
     // Step6: キャッチコピー制作のためのクリエイティブ要素を自動生成（ユーザー追加入力なし）
@@ -1426,6 +1548,7 @@ public class SimpleBot : ActivityHandler
         - 類似や言い換え重複を避け幅を出す
         - 各配列は必ず 5 要素（不足や過剰禁止）
         - 並び順は意味的に自然なら自由
+        - プアな発想は避けること(例：駅前にポスター貼る。では、場所は駅前だ。 ※この場合、駅前にポスターが張られるだけであり、イベントが駅前とはだれも言っていない)
 
         出力は上記 JSON オブジェクトそのもの。先頭/末尾の空行、説明文、コードフェンス禁止。
         """);
@@ -1503,6 +1626,11 @@ public class SimpleBot : ActivityHandler
             - どんな価値／差別化を打ち出すのかが1行で説明できること（例：初心者でも10分で設定完了、地元の実例ストーリーで信頼感、等）
             - 既出の事実に基づくこと（推測や新規追加はしない）
 
+            【ユーザー質問優先ルール（再定義）】
+            - 直近ユーザー発話に Assistant への回答要求を含む未回答質問が残っている場合のみ isSatisfied=false。
+            - 回答拒否/保留/スキップや『次へ』は未回答質問とは見なさない。
+            - 未回答がある場合 reason を『未回答ユーザー質問: 要点…』で始め 1 行。無ければ不足理由のみ。
+
             出力は次のJSONのみ（コードフェンス禁止）：
             {
                 ""isSatisfied"": true,
@@ -1524,10 +1652,8 @@ public class SimpleBot : ActivityHandler
     }
 
     // === Step5（制約事項）関連 ヘルパー ===
-    private static string GenerateInitialConstraintQuestion()
-    {
-        return "キャッチコピー作成で考慮すべき制約事項はありますか？例えば『最大◯文字』『避けたい表現』『法律上必要な表記』『文化的に配慮したい点』などがあれば教えてください。なければ『特にない』でOKです。";
-    }
+    // 以前は初期質問ハードコード / パターン判定が存在したが、ユーザー要望で撤去。
+    // 初期質問も含め LLM プロンプトの記述力に委ねる設計へ移行。
 
     private class ConstraintDecision
     {
@@ -1553,6 +1679,12 @@ public class SimpleBot : ActivityHandler
                 制約カテゴリ: 1) 文字数制限 2) 文化・配慮事項 3) 法規・レギュレーション / 必須表記 4) その他（NGワードや内部基準など）
                 既出情報のみを使用し、推測で新規追加しない。曖昧・未言及は空文字。
                 判定基準: 4カテゴリすべてにおいて『明確に不要』または『明確に記述あり』の状態なら isSatisfied=true。
+                
+                【ユーザー質問優先ルール（再定義）】
+                - 直近ユーザー発話に Assistant への説明/判断を求める未回答質問が残っている場合のみ isSatisfied=false。
+                - 『特にない / まだ / わからない / 次へ / スキップ』等は質問ではないため適用しない。
+                - 前進希望（次へ/スキップ等）があれば本ルールを無視して他基準で判定。
+                - 未回答がある場合 reason を『未回答ユーザー質問: 要点…』で始め 1 行。無い場合は通常理由。
                 出力JSONのみ（コードフェンス禁止）:
                 {
                     ""isSatisfied"": true,
@@ -1583,11 +1715,14 @@ public class SimpleBot : ActivityHandler
         string? finalUsageContext,
         string? finalCoreValue,
         int questionCount,
+        string? evalReason,
         CancellationToken ct)
     {
         var history = new ChatHistory();
     var pacing = questionCount >= 4 ? "（質問が続いているため簡潔に。YES/NOか選択肢提示で手短に）" : string.Empty;
+        var reasonSnippet = string.IsNullOrWhiteSpace(evalReason) ? string.Empty : $"直前の評価で不足とされた点: {evalReason}\n";
         history.AddSystemMessage(@$"あなたは丁寧なコピー制作アシスタントです。今は『制約事項』（文字数 / 文化・配慮 / 法規・レギュレーション / その他）だけを確認します。
+        {reasonSnippet}
         既出を繰り返しすぎない。新規に想像で条件を作らない。{pacing}
 
         厳守ルール:
@@ -1595,9 +1730,14 @@ public class SimpleBot : ActivityHandler
         - 'YES' や 'はい' などの了承単語のみを返してはいけない
         - 箇条書きは最大 1 行に留め、冗長な前置き禁止
         - まだ未確定/空のカテゴリだけを明示的に軽く聞くのは OK
+        - 不足Reasonが示すカテゴリのみ絞り込んで確認（複数同時に羅列しない）
         - 追加が無ければ『特になし』と答えてください、のような誘導を含めてもよい
 
-        出力は質問文 1 行のみ（説明・コードフェンス禁止）。");
+        出力は質問文 1 行のみ（説明・コードフェンス禁止）。評価理由のコピーペーストは禁止。");
+        history.AddSystemMessage(@"【未回答質問ブリッジ】(evalReason に『未回答』が含まれる場合のみ)
+            - 冒頭で未回答ユーザー質問へ 1 行で簡潔に回答（要点言い換え）
+            - 同一行で不足する制約 1 点のみを尋ねる質問（? / ？ を含む）を続ける
+            - 全体を 1 行に保ち複数質問禁止。冗長説明禁止");
         var ctx = new List<string>();
         if (!string.IsNullOrWhiteSpace(step1SummaryJson)) ctx.Add(step1SummaryJson!);
         if (!string.IsNullOrWhiteSpace(finalTarget)) ctx.Add($"[Target]{finalTarget}");
@@ -1605,46 +1745,15 @@ public class SimpleBot : ActivityHandler
         if (!string.IsNullOrWhiteSpace(finalCoreValue)) ctx.Add($"[Core]{finalCoreValue}");
         history.AddUserMessage($"--- コンテキスト（参考） ---\n{string.Join("\n", ctx)}\n\n--- 会話履歴 ---\n{transcript}");
     var response = await InvokeAndLogAsync(kernel, history, ct, "S5/CONSTRAINTS:Q");
-        var text = response?.Content?.Trim();
-        if (IsInvalidConstraintQuestion(text))
+        var cq = response?.Content?.Trim();
+        if (!string.IsNullOrWhiteSpace(cq) && questionCount >= 2 && cq.Length < 140 && !cq.Contains("次へ"))
         {
-            // 1回だけ再試行: 直前出力が不正だったことを明示
-            var retry = new ChatHistory();
-            retry.AddSystemMessage(@"前回あなたは 'YES' など無効な応答を返しました。禁止された形式です。必ず 1 つの有効な質問を作成してください。");
-            foreach (var m in history) retry.Add(m); // 元履歴を付与
-            var second = await InvokeAndLogAsync(kernel, retry, ct, "S5/CONSTRAINTS:Q-RETRY");
-            var secondText = second?.Content?.Trim();
-            if (!IsInvalidConstraintQuestion(secondText)) return secondText;
-            // フォールバック（決して YES だけにならない質問）
-            return "制約の最終確認です。文字数・文化/配慮・法規/必須表記・その他NGで追加や注意したい点はありますか？なければ『特になし』と返信してください。";
+            cq += " （十分であれば『次へ』とだけ返信で先に進みます）";
         }
-        return text;
+        return cq;
     }
-
-    // 制約質問バリデーション: YES/はい 単体や疑問符無しを弾く
-    private static bool IsInvalidConstraintQuestion(string? text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return true;
-        var t = text.Trim();
-        // シンプル了承語だけ
-        var simple = new[] { "YES", "Yes", "yes", "はい", "了解", "承知", "OK", "ok" };
-        if (simple.Contains(t)) return true;
-        // 了承語+句点のみ
-        if (simple.Any(s => t.Equals(s + "。", StringComparison.OrdinalIgnoreCase))) return true;
-        // 疑問符が無い
-        if (!t.Contains('?') && !t.Contains('？')) return true;
-        // 質問語を含まず形式だけ ? を付けた 5 文字以下 (防御的)
-        if (t.Length <= 5 && (t.EndsWith("?") || t.EndsWith("？"))) return true;
-        return false;
-    }
-
-    private static bool IsNoConstraintsUtterance(string? userText)
-    {
-        if (string.IsNullOrWhiteSpace(userText)) return false;
-        var t = userText.Trim();
-        string[] patterns = { "特にない", "特になし", "無しです", "ないです", "ありません" };
-        return patterns.Any(p => t.Contains(p, StringComparison.OrdinalIgnoreCase));
-    }
+    // (削除済) IsInvalidConstraintQuestion / IsNoConstraintsUtterance / 固定フォールバック / 誘導文
+    // すべて撤去し、回答スタイルはプロンプト上の指示とモデル判断に任せる。
 
     private static string RenderConstraintSummary(ElicitationState state)
     {
@@ -1691,6 +1800,16 @@ public class SimpleBot : ActivityHandler
             必要に応じて2〜3個の候補（各1行）を示し、『どれが近いですか？／他にありますか？』と軽く確認するのはOKです。
 
             出力はユーザーにそのまま見せる日本語のテキストのみ。評価理由をそのまま繰り返し羅列するのは避け、質問に自然に反映してください。");
+        history.AddSystemMessage(@"【未回答質問ブリッジ】(evalReason に『未回答』が含まれる場合のみ)
+            - 先に未回答ユーザー質問へ 1 行で簡潔に回答（要点言い換え）
+            - 続けてコア価値の不足 1 点にフォーカスした質問を 1 つ
+            - 回答と質問は '。' でつなぐか 1 文にまとめる。複数質問禁止
+            - 回答のみで十分なら『他にコアの価値で補足があれば教えてください。』等で締めてもよい");
+        history.AddSystemMessage(@"【出力フォーマット厳格化】
+            - 必ず 1 つの日本語の質問文を返す（疑問符 ? または ？ を含む）
+            - 空/回答だけ/列挙羅列/二つ以上の質問/挨拶のみ は不可
+            - 30文字以内目安で一点に集中
+            - 生成不能でも空文字は禁止（最低限の質問を返す）");
 
         var ctx = new List<string>();
         ctx.Add(string.IsNullOrWhiteSpace(step1SummaryJson) ? "(Step1要約なし)" : step1SummaryJson!);
@@ -1698,7 +1817,12 @@ public class SimpleBot : ActivityHandler
         if (!string.IsNullOrWhiteSpace(finalUsageContext)) ctx.Add($"[FinalUsageContext] {finalUsageContext}");
         history.AddUserMessage($"--- コンテキスト（参考） ---\n{string.Join("\n", ctx)}\n\n--- 会話履歴 ---\n{transcript}");
     var response = await InvokeAndLogAsync(kernel, history, ct, "S4/CORE:Q");
-        return response?.Content?.Trim();
+        var cq = response?.Content?.Trim();
+        if (!string.IsNullOrWhiteSpace(cq) && questionCount >= 2 && cq.Length < 140 && !cq.Contains("次へ"))
+        {
+            cq += " （十分であれば『次へ』とだけ返信で先に進みます）";
+        }
+        return cq;
     }
 
 
@@ -1728,6 +1852,12 @@ public class SimpleBot : ActivityHandler
 
                 不足があれば isSatisfied=false とし reason に不足点（例: イベント種類不明 / 対象製品不明 など）を列挙。
 
+                【ユーザー質問優先ルール（再定義）】
+                - Assistant への情報/説明を求める未回答質問が直近にある場合のみ isSatisfied=false。
+                - ユーザーがこちらの質問に答えていない/保留しただけ（『まだ』『特にない』『後で』『次へ』等）は未回答扱いにしない。
+                - 前進希望（次へ/スキップ等）があれば本ルールは適用せず他基準で判定。
+                - 未回答がある場合 reason を『未回答ユーザー質問: 要点…』で始め 1 行。無い場合は不足指摘のみ。
+
                 最初の一回目の会話であれば、ユーザーは、どうすればいいかわかっていない可能性があるので、何をする場面かを説明するようにしてください。
 
                 出力は次のJSONのみ。コードフェンスや余計な前置きは禁止:
@@ -1744,12 +1874,13 @@ public class SimpleBot : ActivityHandler
         try { using var doc = JsonDocument.Parse(json); var root = doc.RootElement; bool isSat = root.TryGetProperty("isSatisfied", out var satEl) && satEl.ValueKind == JsonValueKind.True; string? purpose = root.TryGetProperty("purpose", out var pEl) && pEl.ValueKind == JsonValueKind.String ? pEl.GetString() : null; string? reason = root.TryGetProperty("reason", out var rEl) && rEl.ValueKind == JsonValueKind.String ? rEl.GetString() : null; return new EvalDecision { IsSatisfied = isSat, Purpose = purpose, Reason = reason }; } catch { return null; }
     }
 
-    private static async Task<string?> GenerateNextQuestionAsync(Kernel kernel, string transcript, int questionCount, CancellationToken ct)
+    private static async Task<string?> GenerateNextQuestionAsync(Kernel kernel, string transcript, int questionCount, string? evalReason, CancellationToken ct)
     {
-    var history = new ChatHistory();
-    var pacing = questionCount >= 4
-        ? "（すでに質問が続いているため、深掘りは控えめに。2〜3個の方向性の仮説を各1行で提案し、『どれが近い？／他にありますか？』とだけ確認。畳みかけはNG）"
-        : string.Empty;
+        var history = new ChatHistory();
+        var pacing = questionCount >= 4
+            ? "（すでに質問が続いているため、深掘りは控えめに。2〜3個の方向性の仮説を各1行で提案し、『どれが近い？／他にありますか？』とだけ確認。畳みかけはNG）"
+            : string.Empty;
+        var reasonSnippet = string.IsNullOrWhiteSpace(evalReason) ? string.Empty : $"直前の評価で不足とされた点: {evalReason}\n";
         history.AddSystemMessage(@$"あなたはやさしく話すマーケティングのプロです。工程名は出さず、自然な対話で『活動目的』だけを確かめます。
             テンプレ口調は避け、許可ベースで、短く1つだけ質問してください。質問密度は控えめにしてください{pacing}。
 
@@ -1761,12 +1892,28 @@ public class SimpleBot : ActivityHandler
 
             既にカテゴリは出ていて “何の◯◯か” が欠けている場合は、それを一問で埋める質問を作成。まだカテゴリ自体が曖昧なら、イベント/販促/ブランド認知/採用/その他 のどれが近いか軽い候補提示も可（最大3行）。
 
+            {reasonSnippet}
+
+            【未回答質問ブリッジ】(evalReason に「未回答」が含まれる場合のみ)
+            - まずユーザーの未回答質問へ 1 行で簡潔に回答（質問文の丸写しは禁止。要点を自然に言い換える）
+            - 続けて活動目的の不足点 1 つに絞った質問を 1 つだけ提示
+            - 回答→質問は '。' で自然につなぐ（必要なら 1 文にまとめる）。複数質問は禁止
+            - 回答だけで十分なら質問せず「他に目的で補足があれば教えてください。」等で締めてもよい
+
+            最初の会話であれば、ユーザーは、どうすればいいかわかっていない可能性があるので、何をする場面かを説明するようにしてください。
             ターゲット像や表現案、制作条件には踏み込みません（別フェーズ）。
+
+            不足Reasonがある場合は原文を羅列せず自然な言い換えで 1 点だけ埋める質問にしてください。
 
             出力はユーザーにそのまま見せる日本語テキストのみ。余計な前置きや工程名は禁止。");
         history.AddUserMessage($"--- 会話履歴 ---\n{transcript}");
-    var response = await InvokeAndLogAsync(kernel, history, ct, "S1/PURPOSE:Q");
-        return response?.Content?.Trim();
+        var response = await InvokeAndLogAsync(kernel, history, ct, "S1/PURPOSE:Q");
+        var q = response?.Content?.Trim();
+        if (!string.IsNullOrWhiteSpace(q) && questionCount >= 2 && q.Length < 140 && !q.Contains("次へ"))
+        {
+            q += " （十分であれば『次へ』とだけ返信で先に進みます）";
+        }
+        return q;
     }
 
     // Step1（目的）サマリーの生成（JSON）
@@ -2191,14 +2338,14 @@ public class SimpleBot : ActivityHandler
         if (candidateList.Count >= 2)
         {
             var condensed = candidateList.Take(4).ToList();
-            var numbered = condensed.Select((c, i) => $"{i + 1}) {c}");
             Console.WriteLine($"[DEBUG] Core fallback enumerated ({candidateList.Count} candidates) -> {string.Join(" / ", condensed)}");
-            return "価値の核として最も打ち出したいのはどれでしょうか？ " + string.Join(" ", numbered) + " 5) 他（自由記述）  番号または一言で教えてください。";
+            // 直接列挙を再提示せず LLM 側の次回生成に任せるため空を返す（上位呼び出しで再試行フローがあれば利用）
+            return string.Empty;
         }
 
-        // 0 or 1 件しか拾えなかった場合は汎用一問（以前の固定文）
-        Console.WriteLine($"[DEBUG] Core fallback generic question (candidates={candidateList.Count})");
-        return "提供価値・差別化の核を一言で教えてください。（例：初心者でもすぐ参加できる安心感 など）";
+        // 0 or 1 件しか拾えなかった場合も固定文を避け、LLM の通常質問生成ロジックに委ねる -> 空
+        Console.WriteLine($"[DEBUG] Core fallback generic suppressed (candidates={candidateList.Count})");
+        return string.Empty;
     }
 
 
@@ -2633,6 +2780,12 @@ public class ElicitationState
     public DateTimeOffset? OAuthPromptLastAttemptUtc { get; set; }
     public DateTimeOffset? LastTokenAcquiredUtc { get; set; }
     public DateTimeOffset? DelegatedTokenExpiresUtc { get; set; } // JWT exp (診断用)
+    // --- Evaluation Reasons (for guiding next questions) ---
+    public string? LastPurposeReason { get; set; }
+    public string? LastTargetReason { get; set; }
+    public string? LastMediaReason { get; set; }
+    public string? LastCoreReason { get; set; }
+    public string? LastConstraintsReason { get; set; }
 
     public static ElicitationState CreateNew()
     {

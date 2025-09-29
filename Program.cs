@@ -99,8 +99,17 @@ if (IsSkEnabled(builder.Configuration))
     string? apiKey = Environment.GetEnvironmentVariable("AOAI_API_KEY");
     string? deployment = Environment.GetEnvironmentVariable("AOAI_DEPLOYMENT");
 
+    string Mask(string? secret)
+    {
+        if (string.IsNullOrEmpty(secret)) return "(null)";
+        var trimmed = secret.Trim();
+        if (trimmed.Length <= 4) return new string('*', trimmed.Length);
+        // 先頭4文字 + *** + 末尾2文字 + (len=N) を表示し中身を漏らさない
+        return $"{trimmed.Substring(0,4)}***{trimmed.Substring(trimmed.Length-2,2)}(len={trimmed.Length})";
+    }
+
     Console.WriteLine($"[DEBUG] AOAI_ENDPOINT: {endpoint}");
-    Console.WriteLine($"[DEBUG] AOAI_API_KEY: {apiKey}");
+    Console.WriteLine($"[DEBUG] AOAI_API_KEY: {Mask(apiKey)}");
     Console.WriteLine($"[DEBUG] AOAI_DEPLOYMENT: {deployment}");
 
     if (string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(apiKey) || string.IsNullOrWhiteSpace(deployment))
