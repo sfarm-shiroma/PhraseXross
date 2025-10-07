@@ -718,8 +718,17 @@ public class SimpleBot : ActivityHandler
                 return;
             }
 
-            if (lower == "/reset" || lower == "reset" || lower == "リセット" || lower == "最初から" || lower == "新規" ||
-                lower == "/new" || lower == "new" || lower == "/start" || lower == "start" || lower == "別件" || lower == "別の")
+            // リセットトリガー
+            // - 『リセット』『最初から』は“全文字一致のみ”で発火（ユーザー要望）
+            // - 互換維持のため、従来の英語/スラッシュ系キーワードも残す
+            //   ただし注意: Teams クライアントには /reset（プレゼンス用）のビルトインがあり、
+            //   そちらが優先されるとボットにメッセージが届かない場合があります。
+            //   それでも他チャネル/クライアントや将来の環境を考慮して残置します。
+            if (text == "リセット" || text == "最初から"
+                || lower == "/reset" || lower == "reset"
+                || lower == "新規" || lower == "/new" || lower == "new"
+                || lower == "/start" || lower == "start"
+                || lower == "別件" || lower == "別の")
             {
                 // 既存セッションを完了扱い (未完了なら Cancelled コメント相当)
                 if (!state.Step8Completed && state.CompletedUtc == null)
